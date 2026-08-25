@@ -21,6 +21,9 @@ pub fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
         if part == ".." {
             return None;
         }
+        if !segment_is_usable(part) {
+            return None;
+        }
         let candidate = Path::new(part);
         // A single path segment must be exactly one normal component; anything
         // else is a Windows drive prefix or a root marker sneaking through.
@@ -32,6 +35,46 @@ pub fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
     }
 
     Some(out)
+}
+
+/// Reject path segments Windows would reinterpret rather than treat as a name.
+///
+/// This matters twice over. A read of `data/nul.txt` opens the NUL device and
+/// returns nothing instead of falling through to the archives; and a write —
+/// auto-extract turns a request path into a filename — of `x.txt:stream` lands
+/// in an alternate data stream. Neither character can occur in a legitimate
+/// asset name: CP949 trail bytes fall in 0x41-0x5A, 0x61-0x7A and 0x81-0xFE, so
+/// none of the punctuation below can appear in a mojibake path either.
+///
+/// Only applied on Windows: elsewhere these are ordinary characters, and
+/// refusing them would make a legitimately named file unreachable.
+#[cfg(windows)]
+fn segment_is_usable(segment: &str) -> bool {
+    const RESERVED: [&str; 22] = [
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+
+    if segment.contains(['<', '>', ':', '"', '|', '?', '*']) {
+        return false;
+    }
+    if segment.chars().any(|c| (c as u32) < 0x20) {
+        return false;
+    }
+    // A trailing dot or space is silently stripped by the filesystem, so two
+    // different request paths would name one file.
+    if segment.ends_with('.') || segment.ends_with(' ') {
+        return false;
+    }
+
+    // `nul.txt` is the NUL device just as much as `nul` is.
+    let stem = segment.split('.').next().unwrap_or(segment);
+    !RESERVED.contains(&stem.to_ascii_lowercase().as_str())
+}
+
+#[cfg(not(windows))]
+fn segment_is_usable(_segment: &str) -> bool {
+    true
 }
 
 /// RFC 3339 timestamp in UTC, e.g. `2026-08-25T10:54:00.000Z` — the same shape
@@ -144,6 +187,34 @@ mod tests {
             safe_join(root, "/data//sprite/./foo.spr").unwrap(),
             Path::new("/srv/data/sprite/foo.spr")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn safe_join_refuses_what_windows_would_reinterpret() {
+        let root = Path::new("C:\\srv");
+        // Alternate data streams.
+        assert!(safe_join(root, "data/x.txt:stream").is_none());
+        // Device names, with or without an extension.
+        assert!(safe_join(root, "data/nul").is_none());
+        assert!(safe_join(root, "data/NUL.txt").is_none());
+        assert!(safe_join(root, "data/com1.spr").is_none());
+        // Silently-stripped trailing characters.
+        assert!(safe_join(root, "data/x.txt.").is_none());
+        assert!(safe_join(root, "data/x.txt ").is_none());
+        // Wildcards.
+        assert!(safe_join(root, "data/*.spr").is_none());
+        // And an ordinary asset still resolves, including a mojibake one.
+        assert!(safe_join(root, "data/sprite/foo.spr").is_some());
+        assert!(safe_join(root, "data/texture/\u{c0}\u{af}\u{c0}\u{fa}/a.bmp").is_some());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn safe_join_keeps_names_that_are_only_special_on_windows() {
+        let root = Path::new("/srv");
+        assert!(safe_join(root, "data/nul.txt").is_some());
+        assert!(safe_join(root, "data/x.txt.").is_some());
     }
 
     #[test]
