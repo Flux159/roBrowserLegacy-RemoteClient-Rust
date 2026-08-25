@@ -46,6 +46,49 @@ pub struct Config {
     pub grf_filename_encoding: Option<FilenameEncoding>,
 }
 
+/// Resolve a path and make it absolute, without the `\\?\` prefix that
+/// `canonicalize` adds on Windows.
+///
+/// Verbatim paths are passed to the object manager unnormalised, so they do not
+/// accept `/` as a separator and do not resolve `..`.  Since every path here is
+/// then joined with configuration written by a human — `resources/`,
+/// `../roBrowserLegacy/dist/Web` — keeping the prefix turns ordinary settings
+/// into paths that cannot be opened.
+fn resolve(path: PathBuf) -> PathBuf {
+    let resolved = std::fs::canonicalize(&path).unwrap_or(path);
+
+    #[cfg(windows)]
+    {
+        let text = resolved.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            // Leave `\\?\UNC\server\share` alone: stripping it would produce a
+            // path that no longer names the same thing.
+            let is_drive = rest.as_bytes().get(1) == Some(&b':');
+            if is_drive && !rest.starts_with("UNC\\") {
+                return PathBuf::from(rest.to_string());
+            }
+        }
+    }
+
+    resolved
+}
+
+/// Join a configured relative path onto a root one component at a time.
+///
+/// `CLIENT_RESPATH` conventionally ends in a separator and may use either kind,
+/// and pushing it whole would leave that separator embedded in the result.
+fn join_relative(root: &Path, relative: &str) -> PathBuf {
+    let candidate = Path::new(relative);
+    if candidate.is_absolute() {
+        return candidate.to_path_buf();
+    }
+    let mut path = root.to_path_buf();
+    for part in relative.split(['/', '\\']).filter(|p| !p.is_empty()) {
+        path.push(part);
+    }
+    path
+}
+
 fn env(key: &str) -> Option<String> {
     match std::env::var(key) {
         Ok(v) if !v.is_empty() => Some(v),
@@ -109,26 +152,22 @@ pub fn load_dotenv(path: &Path) -> HashMap<String, String> {
 
 impl Config {
     pub fn from_env() -> Config {
-        let root = env("SERVER_ROOT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let root = std::fs::canonicalize(&root).unwrap_or(root);
+        let root = resolve(
+            env("SERVER_ROOT")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+        );
 
         let node_env = env("NODE_ENV").unwrap_or_else(|| "development".to_string());
         let is_prod = node_env == "production";
 
-        let robrowser_path = {
-            let raw = env("ROBROWSER_PATH").unwrap_or_else(|| "../roBrowserLegacy".to_string());
-            let p = PathBuf::from(&raw);
-            let p = if p.is_absolute() { p } else { root.join(p) };
-            std::fs::canonicalize(&p).unwrap_or(p)
-        };
+        let robrowser_path = resolve(join_relative(
+            &root,
+            &env("ROBROWSER_PATH").unwrap_or_else(|| "../roBrowserLegacy".to_string()),
+        ));
 
-        let data_override_path = env("DATA_OVERRIDE_PATH").map(|raw| {
-            let p = PathBuf::from(&raw);
-            let p = if p.is_absolute() { p } else { root.join(p) };
-            std::fs::canonicalize(&p).unwrap_or(p)
-        });
+        let data_override_path =
+            env("DATA_OVERRIDE_PATH").map(|raw| resolve(join_relative(&root, &raw)));
 
         let ws_allowed_targets = match env("WS_ALLOWED_TARGETS") {
             Some(raw) => raw
@@ -171,11 +210,11 @@ impl Config {
     }
 
     pub fn resources_dir(&self) -> PathBuf {
-        self.root.join(&self.client_respath)
+        join_relative(&self.root, &self.client_respath)
     }
 
     pub fn data_ini_path(&self) -> PathBuf {
-        self.resources_dir().join(&self.client_dataini)
+        join_relative(&self.resources_dir(), &self.client_dataini)
     }
 
     pub fn logs_dir(&self) -> PathBuf {
@@ -271,6 +310,44 @@ mod tests {
     fn data_ini_handles_crlf_and_spacing() {
         let ini = "[Data]\r\n 0 = custom.grf \r\n1=data.grf\r\n";
         assert_eq!(parse_data_ini(ini), vec!["custom.grf", "data.grf"]);
+    }
+
+    #[test]
+    fn a_trailing_separator_in_client_respath_does_not_survive_the_join() {
+        // The default is "resources/", and on Windows a `\\?\` root would treat
+        // an embedded forward slash as an ordinary character rather than a
+        // separator — so DATA.INI would simply never be found.
+        let root = Path::new("/srv");
+        for spelling in ["resources/", "resources", "resources\\", "resources//"] {
+            assert_eq!(
+                join_relative(root, spelling),
+                Path::new("/srv/resources"),
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn join_relative_handles_nesting_and_absolute_overrides() {
+        let root = Path::new("/srv");
+        assert_eq!(join_relative(root, "a/b/c"), Path::new("/srv/a/b/c"));
+        // An absolute setting replaces the root rather than being appended.
+        let absolute = if cfg!(windows) {
+            "C:\\elsewhere"
+        } else {
+            "/elsewhere"
+        };
+        assert_eq!(join_relative(root, absolute), Path::new(absolute));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_strips_the_verbatim_prefix() {
+        let here = resolve(std::env::current_dir().unwrap());
+        let text = here.to_string_lossy();
+        assert!(!text.starts_with(r"\\?\"), "{text}");
+        // And the result still names a real directory.
+        assert!(here.is_dir(), "{text}");
     }
 
     #[test]
