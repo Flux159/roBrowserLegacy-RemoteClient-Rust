@@ -70,6 +70,9 @@ pub struct Grf {
     pub files: Vec<GrfFile>,
     pub stats: GrfStats,
     pub(crate) handle: File,
+    /// Kept so a length read out of the file table can be sanity-checked before
+    /// it is used to size an allocation.
+    pub(crate) size: u64,
 }
 
 #[derive(Debug)]
@@ -247,6 +250,7 @@ impl Grf {
         forced_encoding: Option<FilenameEncoding>,
     ) -> Result<Grf, GrfError> {
         let handle = File::open(path)?;
+        let size = handle.metadata()?.len();
         let header_bytes = read_at(&handle, 0, HEADER_SIZE as usize)?;
         let header = parse_header(&header_bytes)?;
 
@@ -273,6 +277,13 @@ impl Grf {
         if real_size as u64 > MAX_FILE_TABLE_BYTES {
             return Err(GrfError::CorruptTable(format!(
                 "Uncompressed file table too large ({real_size} bytes)"
+            )));
+        }
+        // A length out of a corrupt header would otherwise be believed all the
+        // way to a multi-gigabyte allocation that the read then fails anyway.
+        if table_pos + FILE_TABLE_HEADER_SIZE + compressed_size as u64 > size {
+            return Err(GrfError::CorruptTable(format!(
+                "File table runs past the end of the archive ({compressed_size} bytes at {table_pos})"
             )));
         }
 
@@ -403,6 +414,7 @@ impl Grf {
             files,
             stats,
             handle,
+            size,
         })
     }
 
@@ -410,6 +422,26 @@ impl Grf {
     pub fn read_entry(&self, entry: &GrfEntry) -> io::Result<Vec<u8>> {
         if entry.length_aligned == 0 {
             return Ok(Vec::new());
+        }
+
+        // `length_aligned` is a 32-bit field out of the archive's own table.  A
+        // corrupt one would have us allocate up to 4 GB for a read that cannot
+        // succeed, so check the range against the file first.
+        let end = entry
+            .offset
+            .checked_add(HEADER_SIZE)
+            .and_then(|start| start.checked_add(entry.length_aligned as u64));
+        match end {
+            Some(end) if end <= self.size => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "entry at {} runs past the end of {}",
+                        entry.offset, self.file_name
+                    ),
+                ))
+            }
         }
 
         let mut data = read_at(

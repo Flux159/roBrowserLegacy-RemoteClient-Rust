@@ -255,3 +255,51 @@ fn equal_sizes_mean_stored_not_deflated() {
     assert_eq!(entry.entry.real_size, entry.entry.compressed_size);
     assert_eq!(grf.read_entry(&entry.entry).unwrap(), zlib_stream);
 }
+
+/// A file table is data from a file, and a corrupt entry length would otherwise
+/// be believed all the way to a multi-gigabyte allocation for a read that
+/// cannot succeed. The failure must be an error about one entry, not an
+/// out-of-memory abort that takes the server with it.
+#[test]
+fn an_entry_pointing_past_the_end_of_the_archive_is_an_error_not_an_allocation() {
+    let dir = TempDir::new("grf-oob");
+    let path = dir.join("corrupt.grf");
+    sample_archive().write_v200(&path);
+
+    let grf = Grf::open(&path).unwrap();
+    let good = grf
+        .files
+        .iter()
+        .find(|f| f.name == "data\\plain.txt")
+        .unwrap();
+
+    // The entry claims almost the whole 32-bit range.
+    let mut corrupt = good.entry;
+    corrupt.length_aligned = u32::MAX - 8;
+    assert!(grf.read_entry(&corrupt).is_err());
+
+    // So does one whose offset alone is past the end.
+    let mut far = good.entry;
+    far.offset = u64::MAX - 16;
+    assert!(grf.read_entry(&far).is_err());
+
+    // The undamaged entry beside them still reads.
+    assert_eq!(grf.read_entry(&good.entry).unwrap(), b"plain contents");
+}
+
+#[test]
+fn a_file_table_header_pointing_past_the_end_is_rejected() {
+    let dir = TempDir::new("grf-bad-table");
+    let path = dir.join("bad.grf");
+    sample_archive().write_v200(&path);
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    // Table offset is a u32 at 30, relative to the end of the 46-byte header.
+    let table_offset = u32::from_le_bytes(bytes[30..34].try_into().unwrap()) as usize;
+    let table_pos = 46 + table_offset;
+    // Claim a compressed table far larger than the file.
+    bytes[table_pos..table_pos + 4].copy_from_slice(&(1_000_000_000u32).to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+
+    assert!(Grf::open(&path).is_err());
+}

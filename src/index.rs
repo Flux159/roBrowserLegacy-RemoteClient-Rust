@@ -189,6 +189,7 @@ mod tests {
                 table_real_size: 0,
             },
             handle: null_handle(),
+            size: 0,
         }
     }
 
