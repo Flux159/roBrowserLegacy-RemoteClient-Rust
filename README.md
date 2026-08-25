@@ -165,7 +165,8 @@ cargo test          # 118 unit and integration tests
 
 CI runs the full suite plus `cargo fmt`, `cargo clippy -D warnings` and a
 release build on **Linux, macOS and Windows**, and fails the build if the binary
-grows past 8 MB.
+grows past 8 MB. All three platforms are green, Windows included — GRF parsing,
+DES entries, the mojibake index, the HTTP surface and the proxy all run there.
 
 The integration tests build GRF archives in-process, so they cover the 0x200 and
 0x300 layouts, DES entries in both modes, the four-way mojibake index, archive
@@ -193,6 +194,40 @@ the fixture, in all four spellings, plus `/list-files`, `/batch` and `/search` �
 and finds no difference in status, body or content type. Both servers run with
 their default configuration, so it also covers the extract-then-serve-from-disk
 path: each ends the run having written the same 4,244 files.
+
+### End to end, with a real client
+
+The tests above prove the pieces. This is the whole thing:
+
+A built roBrowserLegacy PWA is served from `ROBROWSER_PATH`, boots, and asks for
+its assets in the mojibake spelling roBrowser actually emits — forward slashes,
+each segment percent-encoded as UTF-8. It logs in, and the client's own network
+trace reads:
+
+```
+[Network] Packet Length initialized   20130618
+[Network] Success to connect to 127.0.0.1:6900
+[Network] Send:  PACKET_CA_LOGIN
+[Network] Recv:  PACKET_AC_ACCEPT_LOGIN
+[Network] Success to connect to 127.0.0.1:6121
+[Network] Send:  PACKET_CH_ENTER
+[Network] Recv:  PACKET_HC_ACCEPT_ENTER_NEO_UNION_HEADER
+[Network] Send:  PACKET_CZ_PING
+```
+
+Two proxied sockets opened in sequence to two different ports, a full login and
+char handshake through each, and the client sitting on the **character select
+screen** afterwards, keepalives running. The slot counter it draws there reads
+back the value the char server sent, so the packet survived the proxy intact.
+
+Under sustained traffic a browser WebSocket held one proxied connection for sixty
+seconds and 2,387 packets — 74,885 bytes each way — with no corruption and no
+outstanding data.
+
+The game servers are stubs speaking the packet layouts from roBrowser's own
+`PacketStructure.js`, and the assets are synthesised, because reaching the map
+itself needs a retail client's archives. Everything between the browser and the
+socket is real.
 
 ## Deliberate differences
 
