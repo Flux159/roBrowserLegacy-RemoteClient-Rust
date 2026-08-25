@@ -1,0 +1,15 @@
+/target/
+**/*.rs.bk
+.DS_Store
+
+# Game assets — copyright Gravity Co., Ltd. Never commit these.
+*.grf
+*.gpf
+/resources/
+DATA.INI
+data.ini
+
+# Local runtime state
+*.log
+/logs/
+path-mapping.json
