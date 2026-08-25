@@ -245,3 +245,30 @@ fn auto_extract_will_not_write_outside_the_server_root() {
     assert!(client.resolve("data/../../escaped.txt").is_none());
     assert!(!escaped.exists(), "wrote outside the server root");
 }
+
+/// A read-only server root is the normal case for a signed app bundle or a
+/// container image. Extraction must degrade to "served from the archive" rather
+/// than turning every asset into a failure.
+#[cfg(unix)]
+#[test]
+fn a_read_only_root_still_serves_assets() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = fixture();
+    let client = client_for(&dir.path, &[]);
+
+    let mut perms = std::fs::metadata(&dir.path).unwrap().permissions();
+    let original = perms.mode();
+    perms.set_mode(0o555);
+    std::fs::set_permissions(&dir.path, perms).unwrap();
+
+    let served = client.resolve("data/only-base.txt");
+
+    let mut restore = std::fs::metadata(&dir.path).unwrap().permissions();
+    restore.set_mode(original);
+    std::fs::set_permissions(&dir.path, restore).unwrap();
+
+    let (file, source) = served.expect("a read-only root must not stop assets being served");
+    assert_eq!(&*file.data, b"base only");
+    assert_eq!(source, Source::Grf(1));
+}

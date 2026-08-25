@@ -342,15 +342,33 @@ impl Client {
     }
 }
 
+/// A read-only server root — an app bundle, a container image, a mounted
+/// volume — fails every single extraction, and a client's first load asks for
+/// thousands of files.  Say so once, usefully, and then stop.
+static EXTRACT_FAILURE_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn report_extract_failure(path: &std::path::Path, error: &std::io::Error) {
+    if EXTRACT_FAILURE_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        debug!("Failed to extract {}: {error}", path.display());
+        return;
+    }
+    warn!(
+        "Could not write extracted assets to {}: {error}\n           Assets are still served from the archives, so this is not fatal.\n           Point SERVER_ROOT at a writable directory, or set CLIENT_AUTOEXTRACT=false \
+         to stop trying. Further failures will not be reported.",
+        path.display()
+    );
+}
+
 fn write_extracted(path: &std::path::Path, content: &[u8]) {
     if let Some(dir) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(dir) {
-            error!("Failed to create {}: {e}", dir.display());
+            report_extract_failure(dir, &e);
             return;
         }
     }
     if let Err(e) = std::fs::write(path, content) {
-        error!("Failed to extract {}: {e}", path.display());
+        report_extract_failure(path, &e);
     }
 }
 

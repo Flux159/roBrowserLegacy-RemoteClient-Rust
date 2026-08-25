@@ -121,6 +121,11 @@ Two consequences worth knowing before you ship it:
 `CLIENT_AUTOEXTRACT=false` turns it off, which is the right setting when disk
 matters more than warm-start latency.
 
+If the server root is read-only — a signed app bundle, a container image — the
+writes fail and assets continue to be served straight from the archives. That is
+reported once, with the reason, rather than once per asset. Point `SERVER_ROOT`
+at a writable directory if you want the extracted copies.
+
 ### Names are CP949, and this is the hard part
 
 GRF entry names are CP949 (Korean) bytes with backslash separators:
