@@ -104,6 +104,13 @@ pub async fn proxy(mut socket: WebSocket, target: String, allowed: Arc<Vec<Strin
         }
     }
 
+    // ws_tx is shared so the teardown below can still send a Close frame after
+    // the pump ends. Dropping it instead aborts the connection underneath the
+    // WebSocket, which the browser reports as "The network connection was
+    // lost" — an error rather than a close.
+    let ws_tx = std::sync::Arc::new(tokio::sync::Mutex::new(ws_tx));
+    let ws_tx_pump = ws_tx.clone();
+
     let client_to_server = async {
         while let Some(message) = ws_rx.next().await {
             let payload = match message {
@@ -126,7 +133,9 @@ pub async fn proxy(mut socket: WebSocket, target: String, allowed: Arc<Vec<Strin
             match tcp_rx.read(&mut buffer).await {
                 Ok(0) => return "server closed",
                 Ok(n) => {
-                    if ws_tx
+                    if ws_tx_pump
+                        .lock()
+                        .await
                         .send(Message::Binary(buffer[..n].to_vec().into()))
                         .await
                         .is_err()
@@ -145,6 +154,14 @@ pub async fn proxy(mut socket: WebSocket, target: String, allowed: Arc<Vec<Strin
         reason = client_to_server => reason,
         reason = server_to_client => reason,
     };
+
+    // Close the WebSocket properly rather than letting the drop abort it.
+    // rAthena hangs up the login socket the moment it authenticates a client,
+    // and roBrowser is mid-handover to the char server when that arrives: an
+    // abort there is seen as the *current* connection failing and the player is
+    // thrown back to the login screen. A Close frame is handled as the ordinary
+    // end of a connection that has already served its purpose.
+    let _ = ws_tx.lock().await.close().await;
 
     info!("WS proxy: closed {target} ({reason})");
 }
