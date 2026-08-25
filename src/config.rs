@@ -32,10 +32,13 @@ pub struct Config {
     pub client_respath: String,
     pub client_dataini: String,
     pub client_enablesearch: bool,
-    /// Write every served asset out to `<root>/<path>`.  The reference does
-    /// this unconditionally; here it is off by default — it silently doubles
-    /// the disk footprint of a client, which is the opposite of what a bundled
-    /// offline app wants.
+    /// Write every served asset out to `<root>/<path>` as it is extracted, so
+    /// the next request for it is answered from disk rather than from the
+    /// archive.  On by default, matching the reference.
+    ///
+    /// The cost is a second copy of everything the client has ever touched, and
+    /// a server that keeps serving those copies after an archive is replaced —
+    /// clear the extracted tree when you swap a GRF.
     pub client_autoextract: bool,
     /// Override GRF filename decoding instead of detecting it.  `auto` (the
     /// default) is right almost always; this is the escape hatch for an archive
@@ -158,7 +161,7 @@ impl Config {
             client_respath: env("CLIENT_RESPATH").unwrap_or_else(|| "resources/".to_string()),
             client_dataini: env("CLIENT_DATAINI").unwrap_or_else(|| "DATA.INI".to_string()),
             client_enablesearch: env_bool("CLIENT_ENABLESEARCH", true),
-            client_autoextract: env_bool("CLIENT_AUTOEXTRACT", false),
+            client_autoextract: env_bool("CLIENT_AUTOEXTRACT", true),
             grf_filename_encoding: match env("GRF_FILENAME_ENCODING").as_deref() {
                 Some("cp949") | Some("euc-kr") => Some(FilenameEncoding::Cp949),
                 Some("utf-8") | Some("utf8") => Some(FilenameEncoding::Utf8),

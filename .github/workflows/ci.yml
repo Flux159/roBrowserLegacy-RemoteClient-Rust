@@ -22,7 +22,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --all-targets
+      # Without this a failing lib test hides every integration suite, which is
+      # exactly how a Windows-only break stayed invisible the first time.
+      - run: cargo test --all-targets --no-fail-fast
       - run: cargo build --release
 
   size:

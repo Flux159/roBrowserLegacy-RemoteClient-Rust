@@ -152,6 +152,13 @@ mod tests {
     use crate::encoding::FilenameEncoding;
     use crate::grf::{GrfEntry, GrfFile, GrfStats};
 
+    /// The index never reads an entry's body, so any open handle will do — but
+    /// it has to be one that exists on the platform running the test.
+    fn null_handle() -> std::fs::File {
+        let path = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        std::fs::File::open(path).expect("null device")
+    }
+
     fn fake_grf(names: &[&str]) -> Grf {
         // Only the fields the index touches are meaningful here.
         Grf {
@@ -181,7 +188,7 @@ mod tests {
                 table_compressed_size: 0,
                 table_real_size: 0,
             },
-            handle: std::fs::File::open("/dev/null").unwrap(),
+            handle: null_handle(),
         }
     }
 

@@ -102,6 +102,25 @@ For any request path, in order — first hit wins:
 5. the Korean reading of the request path, looked up again;
 6. otherwise a 404, recorded at `/api/missing-files`.
 
+### Auto-extract
+
+Assets pulled out of an archive are written to `<root>/<path>` as they are
+served, so the next request for them is answered by step 2 rather than by
+seeking into a multi-gigabyte file. This is on by default, matching the
+reference; the write is handed to a background thread so it stays off the
+response path.
+
+Two consequences worth knowing before you ship it:
+
+- it is a second copy of everything the client has ever touched, so plan for
+  roughly the size of the archives you serve;
+- **replacing a GRF does not change what the server serves** until the extracted
+  tree is deleted, because the copies win. Clear `<root>/data` when you swap an
+  archive.
+
+`CLIENT_AUTOEXTRACT=false` turns it off, which is the right setting when disk
+matters more than warm-start latency.
+
 ### Names are CP949, and this is the hard part
 
 GRF entry names are CP949 (Korean) bytes with backslash separators:
@@ -136,8 +155,12 @@ bytes and comparing a UTF-8 against a CP949 decode.
 ## Testing
 
 ```sh
-cargo test          # 114 unit and integration tests
+cargo test          # 118 unit and integration tests
 ```
+
+CI runs the full suite plus `cargo fmt`, `cargo clippy -D warnings` and a
+release build on **Linux, macOS and Windows**, and fails the build if the binary
+grows past 8 MB.
 
 The integration tests build GRF archives in-process, so they cover the 0x200 and
 0x300 layouts, DES entries in both modes, the four-way mojibake index, archive
@@ -162,19 +185,15 @@ python3 scripts/differential-test.py --js-dir ../roBrowserLegacy-RemoteClient-JS
 The differential run is the most valuable test available and it is cheap. As of
 the last run it compares **11,210 responses across 2,800 paths** — every file in
 the fixture, in all four spellings, plus `/list-files`, `/batch` and `/search` —
-and finds no difference in status, body or content type.
+and finds no difference in status, body or content type. Both servers run with
+their default configuration, so it also covers the extract-then-serve-from-disk
+path: each ends the run having written the same 4,244 files.
 
 ## Deliberate differences
 
 Everything below was found by running the two servers side by side, and each one
 is a considered choice rather than an oversight.
 
-- **`CLIENT_AUTOEXTRACT` defaults to off.** The JS implementation writes every
-  asset it serves to disk and then prefers those copies on the next request.
-  That silently doubles a client's disk footprint, and it means replacing an
-  archive does not change what the server serves until the extracted copies are
-  deleted — which is a genuinely confusing failure. Set `CLIENT_AUTOEXTRACT=true`
-  for the original behaviour.
 - **Filename encoding is detected from names that actually have high bytes**,
   wherever they are in the file table, rather than from the first 200 entries.
   File tables are usually sorted and CP949 names sort after ASCII ones, so an

@@ -185,3 +185,63 @@ fn warm_up_populates_keys_the_browser_will_actually_request() {
     let requested = to_mojibake("data/texture/유저인터페이스/login.bmp");
     assert!(client.cached(&requested).is_some());
 }
+
+/// Auto-extract is on by default, matching the reference: an asset pulled out
+/// of an archive is written beside the server, and the next request for it is
+/// answered from disk rather than from the archive.
+#[test]
+fn an_extracted_asset_is_written_out_and_served_from_disk_next_time() {
+    let dir = fixture();
+    let client = client_for(&dir.path, &[]);
+
+    let (first, source) = client.resolve("data/only-base.txt").unwrap();
+    assert_eq!(source, Source::Grf(1));
+    assert_eq!(&*first.data, b"base only");
+
+    let written = dir.path.join("data/only-base.txt");
+    assert!(written.is_file(), "nothing was extracted to {written:?}");
+    assert_eq!(std::fs::read(&written).unwrap(), b"base only");
+
+    // A fresh client over the same root now finds it without touching a GRF.
+    let second = client_for(&dir.path, &[]);
+    let (file, source) = second.resolve("data/only-base.txt").unwrap();
+    assert_eq!(source, Source::LocalFile);
+    assert_eq!(&*file.data, b"base only");
+}
+
+#[test]
+fn a_korean_asset_is_extracted_under_the_spelling_it_was_requested_by() {
+    let dir = fixture();
+    let client = client_for(&dir.path, &[]);
+
+    let requested = to_mojibake(&KOREAN.replace('\\', "/"));
+    client.resolve(&requested).unwrap();
+
+    let written = dir.path.join(&requested);
+    assert!(written.is_file(), "nothing was extracted to {written:?}");
+    assert_eq!(std::fs::read(&written).unwrap(), b"korean payload");
+}
+
+#[test]
+fn auto_extract_can_be_turned_off() {
+    let dir = fixture();
+    let client = client_for(&dir.path, &[("CLIENT_AUTOEXTRACT", "false")]);
+
+    client.resolve("data/only-base.txt").unwrap();
+    assert!(!dir.path.join("data/only-base.txt").exists());
+}
+
+/// The reference writes wherever the request path points.  A request is not a
+/// trustworthy filename, so a traversal attempt must resolve to nothing and
+/// write nothing.
+#[test]
+fn auto_extract_will_not_write_outside_the_server_root() {
+    let dir = fixture();
+    let escaped = dir.path.parent().unwrap().join("escaped.txt");
+    let _ = std::fs::remove_file(&escaped);
+
+    let client = client_for(&dir.path, &[]);
+    assert!(client.resolve("../escaped.txt").is_none());
+    assert!(client.resolve("data/../../escaped.txt").is_none());
+    assert!(!escaped.exists(), "wrote outside the server root");
+}

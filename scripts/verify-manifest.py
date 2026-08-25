@@ -98,6 +98,9 @@ def main():
         PORT=str(PORT),
         CLIENT_PUBLIC_URL="http://127.0.0.1:8000",
         CACHE_WARM_UP="false",
+        # This checks the archive reader, so nothing may be answered from a
+        # copy the server extracted a moment earlier.
+        CLIENT_AUTOEXTRACT="false",
     )
     process = subprocess.Popen(
         [rust_bin],

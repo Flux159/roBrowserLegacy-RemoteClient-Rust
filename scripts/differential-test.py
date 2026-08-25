@@ -120,17 +120,18 @@ def main():
     shutil.rmtree(js_resources, ignore_errors=True)
     shutil.copytree(os.path.join(fixture, "resources"), js_resources)
 
-    # The reference extracts every asset it serves to disk and then prefers
-    # those copies on the next request, so a leftover extraction from an
-    # earlier fixture is served in place of the archive's current contents.
-    # Backslash-spelled requests land as single files at the root rather than
-    # inside data/, which is why this is not just an `rm -rf data`.
-    shutil.rmtree(os.path.join(js_dir, "data"), ignore_errors=True)
-    shutil.rmtree(os.path.join(js_dir, "logs"), ignore_errors=True)
-    for name in os.listdir(js_dir):
-        if "\\" in name:
-            path = os.path.join(js_dir, name)
-            shutil.rmtree(path, ignore_errors=True) if os.path.isdir(path) else os.remove(path)
+    # Both servers extract every asset they serve to disk and then prefer those
+    # copies on the next request, so a leftover extraction from an earlier
+    # fixture is served in place of the archive's current contents.  In the
+    # reference, backslash-spelled requests land as single files at the root
+    # rather than inside data/, which is why this is not just an `rm -rf data`.
+    for directory in (js_dir, fixture):
+        shutil.rmtree(os.path.join(directory, "data"), ignore_errors=True)
+        shutil.rmtree(os.path.join(directory, "logs"), ignore_errors=True)
+        for name in os.listdir(directory):
+            if "\\" in name:
+                path = os.path.join(directory, name)
+                shutil.rmtree(path, ignore_errors=True) if os.path.isdir(path) else os.remove(path)
 
     env_common = {
         "CLIENT_PUBLIC_URL": "http://127.0.0.1:8000",

@@ -166,7 +166,7 @@ impl Client {
                 Ok(content) => {
                     let content = Arc::new(content);
                     if self.cfg.client_autoextract {
-                        self.extract_file(req_path, &content);
+                        self.extract_file(req_path, Arc::clone(&content));
                     }
                     let file = self.cache.insert(&key, content);
                     return Some((file, Source::Grf(found.grf)));
@@ -196,17 +196,26 @@ impl Client {
             .unwrap_or(None)
     }
 
-    fn extract_file(&self, req_path: &str, content: &[u8]) {
+    /// Write an extracted asset out beside the server so the next request for
+    /// it is answered from disk.
+    ///
+    /// The write is handed to the blocking pool rather than done inline: the
+    /// caller is on the response path, and a client's first load extracts
+    /// thousands of files, some of them tens of megabytes.  The reference defers
+    /// this the same way, with `setImmediate`.  Without a runtime — a warm-up
+    /// pass, a test — it happens inline instead.
+    ///
+    /// `req_path` comes from an HTTP request, so it is joined defensively; the
+    /// reference writes wherever the path points.
+    fn extract_file(&self, req_path: &str, content: Arc<Vec<u8>>) {
         let Some(local) = safe_join(&self.cfg.root, req_path) else {
             return;
         };
-        if let Some(dir) = local.parent() {
-            if std::fs::create_dir_all(dir).is_err() {
-                return;
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || write_extracted(&local, &content));
             }
-        }
-        if let Err(e) = std::fs::write(&local, content) {
-            error!("Failed to extract file: {e}");
+            Err(_) => write_extracted(&local, &content),
         }
     }
 
@@ -330,6 +339,18 @@ impl Client {
         }
 
         warmed
+    }
+}
+
+fn write_extracted(path: &std::path::Path, content: &[u8]) {
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            error!("Failed to create {}: {e}", dir.display());
+            return;
+        }
+    }
+    if let Err(e) = std::fs::write(path, content) {
+        error!("Failed to extract {}: {e}", path.display());
     }
 }
 
