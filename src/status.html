@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>roBrowser Remote Client</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+         max-width: 860px; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.55; }
+  h1 { margin-bottom: .25rem; }
+  .sub { opacity: .7; margin-top: 0; }
+  .card { border: 1px solid rgba(128,128,128,.35); border-radius: 10px; padding: 1rem 1.25rem; margin: 1.25rem 0; }
+  .ok { border-color: #2e7d32; }
+  .warn { border-color: #f9a825; }
+  .err { border-color: #c62828; }
+  code { background: rgba(128,128,128,.15); padding: .1rem .35rem; border-radius: 4px; }
+  ul { padding-left: 1.2rem; }
+  li { margin: .2rem 0; }
+  .msg { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85rem; white-space: pre-wrap; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  td, th { text-align: left; padding: .3rem .5rem; border-bottom: 1px solid rgba(128,128,128,.25); }
+</style>
+</head>
+<body>
+  <h1>roBrowser Remote Client</h1>
+  <p class="sub">Rust implementation &mdash; static server, GRF asset server and WebSocket proxy.</p>
+
+  <div class="card" id="status"><em>Loading status&hellip;</em></div>
+
+  <div class="card">
+    <h2>Endpoints</h2>
+    <ul>
+      <li><code>GET /api/health</code> &mdash; startup validation, archives, cache and index</li>
+      <li><code>GET /api/cache-stats</code> &mdash; live cache and index counters</li>
+      <li><code>GET /api/missing-files</code> &mdash; assets that were requested and not found</li>
+      <li><code>GET /list-files</code> &mdash; every indexed path</li>
+      <li><code>POST /search</code> &mdash; <code>{"filter": "&lt;regex&gt;"}</code></li>
+      <li><code>POST /batch</code> &mdash; <code>{"files": [&hellip;]}</code>, 1&ndash;50 paths, base64 results</li>
+      <li><code>GET /&lt;path&gt;</code> &mdash; a static file, then a GRF asset</li>
+      <li><code>WS /ws/&lt;host&gt;:&lt;port&gt;</code> &mdash; proxied to rAthena, when enabled</li>
+    </ul>
+  </div>
+
+<script>
+const el = document.getElementById('status');
+const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+fetch('/api/health').then(r => r.json()).then(h => {
+  const cls = h.status === 'ok' ? (h.hasWarnings ? 'warn' : 'ok') : 'err';
+  const grfs = (h.details && h.details.grfs && h.details.grfs.files) || [];
+  const rows = grfs.map(g => `<tr><td>${esc(g.file)}</td><td>${esc(g.version || '-')}</td>` +
+    `<td>${g.fileCount != null ? g.fileCount.toLocaleString() : '-'}</td>` +
+    `<td>${g.valid ? 'ok' : 'failed'}</td></tr>`).join('');
+
+  const messages = []
+    .concat((h.messages.errors || []).map(m => 'ERROR   ' + m))
+    .concat((h.messages.warnings || []).map(m => 'WARN    ' + m))
+    .concat((h.messages.info || []).map(m => 'INFO    ' + m));
+
+  el.className = 'card ' + cls;
+  el.innerHTML =
+    `<h2>Status: ${esc(h.status)}</h2>` +
+    `<p>${h.summary.errors} error(s), ${h.summary.warnings} warning(s).` +
+    (h.index ? ` Index: ${h.index.uniqueFiles.toLocaleString()} files across ${h.index.grfCount} archive(s).` : '') +
+    (h.cache ? ` Cache: ${h.cache.size} entries, ${h.cache.memoryUsedMB} MB, hit rate ${h.cache.hitRate}.` : '') +
+    `</p>` +
+    (rows ? `<table><tr><th>Archive</th><th>Version</th><th>Files</th><th></th></tr>${rows}</table>` : '') +
+    `<p class="msg">${esc(messages.join('\n'))}</p>`;
+}).catch(e => {
+  el.className = 'card err';
+  el.textContent = 'Could not read /api/health: ' + e;
+});
+</script>
+</body>
+</html>
