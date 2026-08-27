@@ -1,0 +1,103 @@
+name: Release
+
+# Publishes the asset server binary for every host an embedder ships on.
+#
+# The consumer is Ragnarok Offline, whose CI assembles an app payload from
+# released artifacts rather than cloning and building its dependencies — that
+# keeps an app build from depending on this crate's toolchain. It fetches with
+# `gh release download`, so these have to be release assets and not workflow
+# artifacts: an artifact needs an Actions-scoped token and a run id to point at,
+# which is a different fetch path in every consumer.
+#
+# Assets are named by host triple, matching what nebula's embed kits do, so a
+# consumer's download pattern needs no per-platform special case.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write # attach release assets
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners for each target. The crate is pure Rust with no C
+          # dependencies, so this needs no cross toolchain — and building on the
+          # host it will run on avoids an entire class of linkage surprise.
+          - os: macos-latest
+            triple: aarch64-apple-darwin
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            triple: x64-unknown-linux
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            triple: x64-pc-windows
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --release --target ${{ matrix.target }}
+
+      # The binary is the whole deliverable — one static file, which is the
+      # reason this crate exists in place of a 106 MB Node runtime. Stripped,
+      # because debug symbols are most of what is left.
+      - name: Stage the binary
+        shell: bash
+        run: |
+          set -e
+          src="target/${{ matrix.target }}/release/robrowser-remoteclient"
+          out="robrowser-remoteclient-${{ matrix.triple }}"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            src="$src.exe"; out="$out.exe"
+          else
+            strip "$src" || true
+          fi
+          cp "$src" "$out"
+          ls -lh "$out"
+
+      # Refuse to publish something that cannot start. A binary that builds but
+      # dies on launch is worse than a failed build: the failure surfaces in a
+      # consumer's app days later with nothing pointing back here.
+      #
+      # --version only, with a timeout, and no fallback: main() returns early on
+      # --version, but every other argument falls through to starting the
+      # server, which would sit there holding the job open until the runner
+      # times out. A hung CI job is harder to read than a failed one.
+      - name: Smoke-test
+        shell: bash
+        run: |
+          set -e
+          out="./robrowser-remoteclient-${{ matrix.triple }}"
+          [ "${{ matrix.os }}" = "windows-latest" ] && out="$out.exe"
+          if command -v timeout >/dev/null; then
+            timeout 30 "$out" --version
+          else
+            "$out" --version
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: robrowser-remoteclient-${{ matrix.triple }}
+          path: robrowser-remoteclient-${{ matrix.triple }}*
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: robrowser-remoteclient-${{ matrix.triple }}*
