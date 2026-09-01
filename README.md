@@ -16,6 +16,8 @@ and does that project's three jobs on one port:
 Start with roBrowserLegacy's own documentation; this is a drop-in replacement
 for one part of it, not a separate thing to learn.
 
+roBrowserLegacy-RemoteClient-Rust is used by [ragnarokoffline.app](https://github.com/Flux159/ragnarokoffline.app).
+
 ## Building
 
 ```sh
