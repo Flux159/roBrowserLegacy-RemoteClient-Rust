@@ -60,6 +60,21 @@ fn reads_a_v300_archive() {
 }
 
 #[test]
+fn reads_an_event_horizon_archive() {
+    // GRF Editor writes 0x300 archives signed "Event Horizon" rather than
+    // "Master of Magic". The container is the one already supported -- only
+    // the signature differs -- so rejecting it turned away whole modern
+    // clients over 13 bytes.
+    let dir = TempDir::new("grf-eh3");
+    let path = dir.join("eh.grf");
+    sample_archive().write_v300_event_horizon(&path);
+
+    let grf = Grf::open(&path).expect("Event Horizon archive should load");
+    assert_eq!(grf.version, 0x300);
+    assert_eq!(grf.files.len(), 4);
+}
+
+#[test]
 fn an_uncompressed_entry_is_returned_without_padding() {
     let dir = TempDir::new("grf-stored");
     let path = dir.join("test.grf");

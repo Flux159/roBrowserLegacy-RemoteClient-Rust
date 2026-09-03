@@ -109,7 +109,20 @@ impl GrfBuilder {
         self.write(path, 0x300);
     }
 
+    /// A 0x300 archive signed the way GRF Editor signs them.
+    ///
+    /// The signature is shorter than the 15-byte field, and the bytes after
+    /// its terminator are not padding -- real archives carry data there, so
+    /// this writes some to keep the test honest about what has to be ignored.
+    pub fn write_v300_event_horizon(&self, path: &Path) {
+        self.write_signed(path, 0x300, b"Event Horizon\0c\0");
+    }
+
     fn write(&self, path: &Path, version: u32) {
+        self.write_signed(path, version, b"Master of Magic");
+    }
+
+    fn write_signed(&self, path: &Path, version: u32, signature: &[u8]) {
         let mut body: Vec<u8> = Vec::new();
         let mut table: Vec<u8> = Vec::new();
 
@@ -167,7 +180,7 @@ impl GrfBuilder {
         let compressed_table = deflate(&table);
 
         let mut header = vec![0u8; 46];
-        header[0..15].copy_from_slice(b"Master of Magic");
+        header[0..signature.len()].copy_from_slice(signature);
         let table_offset = body.len() as u64;
 
         if version == 0x300 {

@@ -14,7 +14,15 @@ use crate::des;
 use crate::encoding::{detect_best_encoding, FilenameEncoding};
 
 pub const HEADER_SIZE: u64 = 46;
-const HEADER_SIGNATURE: &[u8; 15] = b"Master of Magic";
+/// The two signatures a GRF is written with.
+///
+/// "Master of Magic" is the retail one and fills all 15 bytes.  "Event
+/// Horizon" is what GRF Editor writes for the 0x300 container, and it is
+/// shorter — the bytes after its NUL terminator carry other data (observed:
+/// `Event Horizon\0c\0` in one archive and `Event Horizon\0RL` in another
+/// from the same client), so the signature has to be compared as a
+/// NUL-terminated string rather than against a fixed 15 bytes.
+const HEADER_SIGNATURES: [&str; 2] = ["Master of Magic", "Event Horizon"];
 const FILE_TABLE_HEADER_SIZE: u64 = 8;
 
 const FILELIST_TYPE_FILE: u8 = 0x01;
@@ -153,13 +161,13 @@ fn parse_header(bytes: &[u8]) -> Result<Header, GrfError> {
         ));
     }
 
-    if &bytes[0..15] != HEADER_SIGNATURE {
-        let shown: String = bytes[0..15]
-            .iter()
-            .take_while(|&&b| b != 0)
-            .map(|&b| b as char)
-            .collect();
-        return Err(GrfError::InvalidSignature(shown));
+    let signature: String = bytes[0..15]
+        .iter()
+        .take_while(|&&b| b != 0)
+        .map(|&b| b as char)
+        .collect();
+    if !HEADER_SIGNATURES.contains(&signature.as_str()) {
+        return Err(GrfError::InvalidSignature(signature));
     }
 
     let version = u32_le(bytes, 42);
@@ -477,9 +485,26 @@ impl Grf {
 mod tests {
     use super::*;
 
+    #[test]
+    fn accepts_both_signatures_and_rejects_others() {
+        let mut b = header_bytes(0x200, 8, 0, 7);
+        assert!(parse_header(&b).is_ok());
+
+        // Shorter than the field, with live bytes after the terminator.
+        b[0..15].copy_from_slice(b"Event Horizon\0c");
+        assert!(parse_header(&b).is_ok(), "Event Horizon should be accepted");
+
+        b[0..15].copy_from_slice(b"Sword of Chaos!");
+        match parse_header(&b) {
+            Err(GrfError::InvalidSignature(s)) => assert_eq!(s, "Sword of Chaos!"),
+            Err(e) => panic!("expected InvalidSignature, got {e}"),
+            Ok(_) => panic!("expected InvalidSignature, got a parsed header"),
+        }
+    }
+
     fn header_bytes(version: u32, table_offset: u32, seed: u32, n_files: u32) -> Vec<u8> {
         let mut b = vec![0u8; 46];
-        b[0..15].copy_from_slice(HEADER_SIGNATURE);
+        b[0..15].copy_from_slice(HEADER_SIGNATURES[0].as_bytes());
         b[30..34].copy_from_slice(&table_offset.to_le_bytes());
         b[34..38].copy_from_slice(&seed.to_le_bytes());
         b[38..42].copy_from_slice(&n_files.to_le_bytes());
