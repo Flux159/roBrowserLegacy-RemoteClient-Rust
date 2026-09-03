@@ -1,6 +1,6 @@
 [package]
 name = "robrowser-remoteclient"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 rust-version = "1.75"
 description = "Single-binary roBrowserLegacy Remote Client: static server, GRF asset server and WebSocket-to-TCP proxy"
