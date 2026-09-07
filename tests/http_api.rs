@@ -8,6 +8,69 @@ use support::{client_for, config_for, request, write_data_ini, GrfBuilder, TempD
 
 const KOREAN: &str = "data\\texture\\유저인터페이스\\btn_ok.bmp";
 
+#[tokio::test]
+async fn external_music_serves_bytes_but_private_files_and_containers_do_not() {
+    let external = TempDir::new("http-client");
+    external.write("BGM/track.mp3", b"external music");
+    let web = TempDir::new("http-private-web");
+    for path in [
+        ".env",
+        "resources/DATA.INI",
+        "leak.grf",
+        "logs/missing-files.log",
+    ] {
+        web.write(path, b"private");
+    }
+    let (dir, server) = server(&[
+        ("BGM_PATH", external.join("BGM").to_str().unwrap()),
+        ("ROBROWSER_PATH", web.path.to_str().unwrap()),
+        ("ENABLE_STATIC_SERVE", "true"),
+    ])
+    .await;
+    dir.write(
+        ".translation/data/secret.txt",
+        b"private translation snapshot",
+    );
+    let response = request(server.addr, "GET", "/BGM/track.mp3", &[], None).await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"external music");
+    dir.write(
+        "Config.local.js",
+        b"window.ROConfigLocal = {renewal: false};",
+    );
+    web.write("Config.local.js", b"stale bundled configuration");
+    let config = request(server.addr, "GET", "/Config.local.js", &[], None).await;
+    assert_eq!(config.body, b"window.ROConfigLocal = {renewal: false};");
+    assert_eq!(config.header("cache-control"), Some("no-store"));
+    let paths = [
+        "/.env",
+        "/%2eenv",
+        "/resources/DATA.INI",
+        "/leak.grf",
+        "/logs/missing-files.log",
+        "/.translation/data/secret.txt",
+        "/resources/data.grf",
+    ];
+    for path in paths {
+        assert_eq!(
+            request(server.addr, "GET", path, &[], None).await.status,
+            404,
+            "{path}"
+        );
+    }
+    let body = json!({"files": ["resources/data.grf", ".translation/data/secret.txt"]}).to_string();
+    let response = request(
+        server.addr,
+        "POST",
+        "/batch",
+        &[("Content-Type", "application/json")],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.json(), json!({}));
+}
+
 async fn server(overrides: &[(&str, &str)]) -> (TempDir, TestServer) {
     let dir = TempDir::new("http");
     GrfBuilder::new()

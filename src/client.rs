@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::encoding::{decode_mojibake, js_lowercase, to_mojibake};
 use crate::grf::Grf;
 use crate::index::{norm_forward, AssetIndex};
-use crate::util::{iso_now, safe_join};
+use crate::util::{confined_file, iso_now, public_asset_path, safe_join};
 use crate::{debug, error, warn};
 
 /// In-memory ring of misses, matching the reference's bounds.
@@ -74,6 +74,7 @@ pub struct Client {
 pub enum Source {
     Cache,
     LocalFile,
+    ClientDirectory,
     DataOverride,
     Grf(u16),
 }
@@ -107,12 +108,18 @@ impl Client {
     /// Cache-only lookup, so a conditional request can be answered with the
     /// stored ETag without touching an archive.
     pub fn cached(&self, req_path: &str) -> Option<CachedFile> {
+        if !public_asset_path(req_path) {
+            return None;
+        }
         self.cache.get(&Self::cache_key(req_path))
     }
 
     /// Resolve a request path to bytes.  Blocking — GRF reads seek into a
     /// multi-gigabyte file and then inflate.
     pub fn resolve(&self, req_path: &str) -> Option<(CachedFile, Source)> {
+        if !public_asset_path(req_path) || safe_join(&self.cfg.root, req_path).is_none() {
+            return None;
+        }
         let key = Self::cache_key(req_path);
 
         if let Some(hit) = self.cache.get(&key) {
@@ -129,6 +136,28 @@ impl Client {
                         return Some((file, Source::LocalFile));
                     }
                     Err(e) => error!("Error reading local file: {e}"),
+                }
+            }
+        }
+
+        // Selected client directories are fallback reads, never a writable
+        // static root. App-owned mod files above retain precedence.
+        let normalized = req_path.replace('\\', "/");
+        if let Some((namespace, relative)) = normalized.split_once('/') {
+            let base = if namespace.eq_ignore_ascii_case("BGM") {
+                self.cfg.bgm_path.as_ref()
+            } else if namespace.eq_ignore_ascii_case("AI") {
+                self.cfg.ai_path.as_ref()
+            } else {
+                None
+            };
+            if let Some(path) = base.and_then(|base| confined_file(base, relative)) {
+                match std::fs::read(path) {
+                    Ok(content) => {
+                        let file = self.cache.insert(&key, Arc::new(content));
+                        return Some((file, Source::ClientDirectory));
+                    }
+                    Err(e) => error!("Error reading selected client asset: {e}"),
                 }
             }
         }

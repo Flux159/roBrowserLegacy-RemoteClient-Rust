@@ -20,7 +20,7 @@ use crate::client::Client;
 use crate::config::Config;
 use crate::encoding::latin1_decode;
 use crate::http::{self, Cors};
-use crate::util::{base64_encode, extension_of, safe_join};
+use crate::util::{base64_encode, extension_of, public_asset_path, safe_join};
 use crate::{debug, warn};
 
 const STATUS_PAGE: &str = include_str!("status.html");
@@ -281,6 +281,29 @@ async fn serve_path(State(state): State<AppState>, request: Request) -> Response
     let headers = request.headers().clone();
     let is_head = request.method() == Method::HEAD;
     let relative = decode_request_path(raw_path.trim_start_matches('/'));
+
+    if !public_asset_path(&relative) {
+        return finish(http::not_found(), is_head);
+    }
+
+    // Generated host configuration lives with the asset generation, not in
+    // the signed application payload (which may be on another volume).
+    let generated = match relative.as_str() {
+        "" | "index.html" => Some("index.html"),
+        "Config.local.js" => Some("Config.local.js"),
+        _ => None,
+    };
+    if let Some(name) = generated {
+        if let Ok(bytes) = tokio::fs::read(state.cfg.root.join(name)).await {
+            let response = Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, http::content_type_for(&extension_of(name)))
+                .header(CACHE_CONTROL, "no-store")
+                .body(Body::from(bytes))
+                .unwrap();
+            return finish(response, is_head);
+        }
+    }
 
     // 1. The built client, when this server is also serving it.
     if state.cfg.enable_static_serve {

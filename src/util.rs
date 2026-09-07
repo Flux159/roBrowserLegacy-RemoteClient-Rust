@@ -3,6 +3,27 @@
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Private configuration and archive containers are never downloadable assets.
+/// Apply before static serving, resolution and cache lookup (including batch).
+pub fn public_asset_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let parts: Vec<_> = normalized.split('/').filter(|p| !p.is_empty()).collect();
+    !parts.iter().any(|p| p.starts_with('.'))
+        && !matches!(parts.first(), Some(&"logs" | &"resources"))
+        && !parts
+            .last()
+            .is_some_and(|p| *p == "data.ini" || p.ends_with(".grf") || p.ends_with(".gpf"))
+}
+
+/// Read-only lookup within an explicitly selected directory. Canonicalization
+/// prevents a nested symlink/junction from exposing a sibling or parent folder.
+pub fn confined_file(root: &Path, rel: &str) -> Option<PathBuf> {
+    let candidate = safe_join(root, rel)?;
+    let base = root.canonicalize().ok()?;
+    let file = candidate.canonicalize().ok()?;
+    (file.starts_with(base) && file.is_file()).then_some(file)
+}
+
 /// Join a request-supplied relative path onto a root, refusing anything that
 /// could escape it.  Every path in this server originates from an HTTP request,
 /// including the ones that get written back to disk when auto-extract is on.
