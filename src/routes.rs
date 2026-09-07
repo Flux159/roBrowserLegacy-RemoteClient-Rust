@@ -96,26 +96,20 @@ fn json_response(
     http::maybe_compress(headers, response, body, state.cfg.enable_compression)
 }
 
-/// Startup validation merged with live counters.  Answers immediately, before
-/// any asset is warm — it is a readiness probe, not a smoke test.
+/// Public readiness reveals no local paths, controls or credentials. Detailed
+/// counters remain in the diagnostic routes; process identity uses the private
+/// authenticated control socket, never this unauthenticated HTTP endpoint.
 async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let mut value = (*state.health).clone();
-    if let Some(object) = value.as_object_mut() {
-        object.insert(
-            "missingFiles".into(),
-            serde_json::to_value(state.client.missing_summary()).unwrap_or(Value::Null),
-        );
-        object.insert(
-            "cache".into(),
-            serde_json::to_value(state.client.cache_stats()).unwrap_or(Value::Null),
-        );
-        object.insert(
-            "index".into(),
-            serde_json::to_value(state.client.index_stats()).unwrap_or(Value::Null),
-        );
-        object.insert("esrgan".into(), json!({ "enabled": false }));
-    }
-    json_response(&headers, &state, &value, "no-store")
+    json_response(
+        &headers,
+        &state,
+        &json!({
+            "status": "ok",
+            "service": "robrowser-remoteclient",
+            "version": env!("CARGO_PKG_VERSION"),
+        }),
+        "no-store",
+    )
 }
 
 async fn cache_stats(State(state): State<AppState>, headers: HeaderMap) -> Response {

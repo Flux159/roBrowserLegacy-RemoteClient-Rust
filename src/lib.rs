@@ -13,6 +13,7 @@ pub mod grf;
 pub mod http;
 pub mod index;
 pub mod logger;
+pub mod managed;
 pub mod routes;
 pub mod util;
 pub mod validator;

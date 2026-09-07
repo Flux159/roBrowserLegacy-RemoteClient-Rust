@@ -11,7 +11,7 @@ use robrowser_remoteclient::client::Client;
 use robrowser_remoteclient::config::{self, Config};
 use robrowser_remoteclient::http::Cors;
 use robrowser_remoteclient::routes::{self, AppState};
-use robrowser_remoteclient::{error, info, logger, validator};
+use robrowser_remoteclient::{error, info, logger, managed::Managed, validator};
 
 fn main() {
     // The blocking pool does the GRF reads; the async runtime does the sockets.
@@ -38,11 +38,34 @@ async fn run() -> i32 {
         .unwrap_or(cwd);
     config::load_dotenv(&dotenv_root.join(".env"));
 
+    let bootstrap = if std::env::args().any(|a| a == "--managed") {
+        match Managed::bootstrap() {
+            Ok(value) => Some(value),
+            Err(e) => {
+                error!("Managed startup failed: {e}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+
     let cfg = Arc::new(Config::from_env());
     logger::set_debug(!cfg.is_prod);
 
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         info!("robrowser-remoteclient {}", env!("CARGO_PKG_VERSION"));
+        return 0;
+    }
+
+    if std::env::args().any(|a| a == "--capabilities") {
+        println!(
+            "{}",
+            serde_json::json!({
+                "service": "robrowser-remoteclient", "version": env!("CARGO_PKG_VERSION"),
+                "managedProtocol": robrowser_remoteclient::managed::PROTOCOL,
+            })
+        );
         return 0;
     }
 
@@ -99,6 +122,29 @@ async fn run() -> i32 {
         stats.grf_count
     );
 
+    let mut managed = match bootstrap {
+        Some(bootstrap) => match Managed::start(bootstrap, cfg.port).await {
+            Ok((managed, shutdown)) => {
+                // The parent keeps stdin open. EOF also covers force-quit and
+                // crashes, without a PID-reuse race or platform process scans.
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut buf = [0u8; 256];
+                    let stdin = std::io::stdin();
+                    let mut input = stdin.lock();
+                    while matches!(input.read(&mut buf), Ok(n) if n > 0) {}
+                    let _ = shutdown.send(true);
+                });
+                Some(managed)
+            }
+            Err(e) => {
+                error!("Managed startup failed: {e}");
+                return 1;
+            }
+        },
+        None => None,
+    };
+
     let state = AppState {
         cfg: Arc::clone(&cfg),
         client: Arc::clone(&client),
@@ -116,6 +162,13 @@ async fn run() -> i32 {
             return 1;
         }
     };
+
+    if let Some(managed) = &managed {
+        if let Err(e) = managed.announce() {
+            error!("Could not notify parent: {e}");
+            return 1;
+        }
+    }
 
     let mut banner = format!("Server ready on http://localhost:{}", cfg.port);
     if cfg.enable_static_serve {
@@ -147,7 +200,7 @@ async fn run() -> i32 {
         });
     }
 
-    let shutdown = async {
+    let os_shutdown = async {
         let ctrl_c = tokio::signal::ctrl_c();
         #[cfg(unix)]
         {
@@ -168,7 +221,22 @@ async fn run() -> i32 {
         {
             let _ = ctrl_c.await;
         }
+    };
+    let shutdown = async move {
+        let managed_shutdown = async {
+            match managed.as_mut() {
+                Some(m) => m.stopped().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! { _ = os_shutdown => {}, _ = managed_shutdown => {} }
         info!("Shutting down.");
+        // Upgraded WebSocket sessions can otherwise hold graceful shutdown
+        // forever. Bound teardown even when a browser never closes its socket.
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            std::process::exit(0);
+        });
     };
 
     if let Err(e) = axum::serve(listener, app)
