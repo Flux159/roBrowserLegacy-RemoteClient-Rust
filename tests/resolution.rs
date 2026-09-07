@@ -84,8 +84,8 @@ fn selected_directory_cannot_escape_through_a_windows_junction() {
     let junction = external.join("BGM/escape");
     let status = std::process::Command::new("cmd.exe")
         .args(["/c", "mklink", "/J"])
-        .arg(&junction)
-        .arg(external.join("private"))
+        .arg(junction.to_string_lossy().replace('/', "\\"))
+        .arg(external.join("private").to_string_lossy().replace('/', "\\"))
         .status()
         .unwrap();
     assert!(status.success(), "unprivileged junction fixture failed");
