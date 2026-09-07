@@ -47,7 +47,8 @@ async fn start() -> Running {
     .collect();
     let mut child = Command::new(env!("CARGO_BIN_EXE_robrowser-remoteclient"))
         .arg("--managed")
-        .env_clear()
+        // Windows needs SystemRoot to load Winsock providers. Keep the OS
+        // environment while overriding every setting relevant to this fixture.
         .envs(&environment)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
