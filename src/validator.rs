@@ -257,6 +257,17 @@ fn validate_environment(cfg: &Config, b: &mut Builder) -> Value {
         );
     }
 
+    for (name, path) in [("BGM_PATH", &cfg.bgm_path), ("AI_PATH", &cfg.ai_path)] {
+        if let Some(path) = path {
+            if !path.is_dir() || std::fs::read_dir(path).is_err() {
+                b.error(format!(
+                    "{name} is not a readable directory: {}. Reselect the client folder.",
+                    path.display()
+                ));
+            }
+        }
+    }
+
     if !cfg.root.join(".env").exists() {
         b.warn(".env file not found! Copy .env.example to .env and configure it");
     }

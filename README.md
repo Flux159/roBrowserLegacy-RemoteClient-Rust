@@ -37,6 +37,29 @@ mkdir -p resources        # put your GRFs and DATA.INI here
 
 `.env.example` documents every setting.
 
+## Assets on separate drives
+
+`CLIENT_DATAINI` accepts an absolute private manifest path. Numbered `[Data]`
+entries accept absolute GRF paths, with lower indices taking priority; archives
+are opened in place without file links or copies. Keep the resources directory
+present for startup validation even when its archive entries are all absolute.
+
+`BGM_PATH` and `AI_PATH` provide read-only fallbacks for their respective request
+namespaces. Resolution checks the memory cache, app-owned loose files, the
+selected namespace folder, the translation override, then the GRFs. Nested
+symlinks/junctions cannot escape a selected namespace root. Missing configured
+directories fail validation. Extraction always targets the served root.
+
+Hidden path components, `logs/`, `resources/`, `DATA.INI` and raw GRF/GPF
+containers are refused by static and asset serving, including batch resolution.
+Generated `Config.local.js` and `index.html` in the served root take precedence
+over the built web payload and use `no-store`, so an embedder can atomically
+replace its configuration without modifying the installed application.
+
+These path restrictions are not authentication. Do not expose an unrestricted
+instance to the internet; protected hosting requires an access gateway covering
+HTTP and WebSocket upgrades.
+
 ## Embedded process ownership
 
 Embedders can use `--managed` (protocol 1, discoverable with

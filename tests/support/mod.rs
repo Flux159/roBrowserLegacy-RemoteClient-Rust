@@ -295,6 +295,8 @@ pub fn config_for(root: &Path, overrides: &[(&str, &str)]) -> Config {
         "ROBROWSER_PATH",
         "WS_ALLOWED_TARGETS",
         "DATA_OVERRIDE_PATH",
+        "BGM_PATH",
+        "AI_PATH",
         "CACHE_MAX_FILES",
         "CACHE_MAX_MEMORY_MB",
         "CACHE_WARM_UP",

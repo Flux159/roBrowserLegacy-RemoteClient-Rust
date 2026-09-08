@@ -25,6 +25,10 @@ pub struct Config {
     pub robrowser_path: PathBuf,
     pub ws_allowed_targets: Vec<String>,
     pub data_override_path: Option<PathBuf>,
+    /// Read-only fallbacks scoped to BGM/ and AI/. These never become a static
+    /// root, and writes/extraction still belong to the app-owned server root.
+    pub bgm_path: Option<PathBuf>,
+    pub ai_path: Option<PathBuf>,
     pub cache_max_files: usize,
     pub cache_max_memory_mb: usize,
     pub cache_warm_up: bool,
@@ -179,7 +183,7 @@ impl Config {
         };
 
         Config {
-            root,
+            root: root.clone(),
             port: env("PORT")
                 .and_then(|v| v.trim().parse::<u16>().ok())
                 .unwrap_or(3338),
@@ -193,6 +197,8 @@ impl Config {
             robrowser_path,
             ws_allowed_targets,
             data_override_path,
+            bgm_path: env("BGM_PATH").map(|raw| resolve(join_relative(&root, &raw))),
+            ai_path: env("AI_PATH").map(|raw| resolve(join_relative(&root, &raw))),
             cache_max_files: env_usize("CACHE_MAX_FILES", 5000),
             cache_max_memory_mb: env_usize("CACHE_MAX_MEMORY_MB", 1024),
             cache_warm_up: env_bool("CACHE_WARM_UP", false),

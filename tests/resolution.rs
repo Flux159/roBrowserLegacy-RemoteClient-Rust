@@ -9,6 +9,130 @@ use support::{client_for, write_data_ini, GrfBuilder, TempDir};
 
 const KOREAN: &str = "data\\sprite\\인간족\\검사\\검사_남_1460.act";
 
+#[test]
+fn selected_client_directories_are_scoped_read_only_fallbacks() {
+    let dir = fixture();
+    let external = TempDir::new("external-client");
+    external.write("BGM/track.mp3", b"original music");
+    external.write("BGM/custom.mp3", b"original custom");
+    external.write("AI/AI.lua", b"original AI");
+    external.write("private.txt", b"not an asset");
+    dir.write("BGM/custom.mp3", b"mod music");
+    let client = client_for(
+        &dir.path,
+        &[
+            ("BGM_PATH", external.join("BGM").to_str().unwrap()),
+            ("AI_PATH", external.join("AI").to_str().unwrap()),
+            ("CLIENT_AUTOEXTRACT", "true"),
+        ],
+    );
+    let (file, source) = client.resolve("BGM/track.mp3").unwrap();
+    assert_eq!(&*file.data, b"original music");
+    assert_eq!(source, Source::ClientDirectory);
+    assert_eq!(
+        &*client.resolve("BGM/custom.mp3").unwrap().0.data,
+        b"mod music"
+    );
+    assert_eq!(
+        &*client.resolve("AI/AI.lua").unwrap().0.data,
+        b"original AI"
+    );
+    for path in [
+        "private.txt",
+        "BGM/../private.txt",
+        "AI/../private.txt",
+        "data/track.mp3",
+    ] {
+        assert!(client.resolve(path).is_none(), "{path}");
+    }
+    assert!(
+        !dir.join("BGM/track.mp3").exists(),
+        "fallback must not duplicate music"
+    );
+    assert_eq!(
+        std::fs::read(external.join("BGM/custom.mp3")).unwrap(),
+        b"original custom"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn selected_directory_cannot_escape_through_nested_symlinks() {
+    let dir = fixture();
+    let external = TempDir::new("symlink-client");
+    external.write("BGM/valid.mp3", b"music");
+    external.write("private.txt", b"private");
+    std::os::unix::fs::symlink(
+        external.join("private.txt"),
+        external.join("BGM/escape.mp3"),
+    )
+    .unwrap();
+    let client = client_for(
+        &dir.path,
+        &[("BGM_PATH", external.join("BGM").to_str().unwrap())],
+    );
+    assert!(client.resolve("BGM/escape.mp3").is_none());
+}
+
+#[cfg(windows)]
+#[test]
+fn selected_directory_cannot_escape_through_a_windows_junction() {
+    let dir = fixture();
+    let external = TempDir::new("junction-client");
+    external.write("BGM/valid.mp3", b"music");
+    external.write("private/secret.txt", b"private");
+    let junction = external.join("BGM/escape");
+    let status = std::process::Command::new("cmd.exe")
+        .args(["/c", "mklink", "/J"])
+        .arg(junction.to_string_lossy().replace('/', "\\"))
+        .arg(
+            external
+                .join("private")
+                .to_string_lossy()
+                .replace('/', "\\"),
+        )
+        .status()
+        .unwrap();
+    assert!(status.success(), "unprivileged junction fixture failed");
+    let client = client_for(
+        &dir.path,
+        &[("BGM_PATH", external.join("BGM").to_str().unwrap())],
+    );
+    assert!(client.resolve("BGM/escape/secret.txt").is_none());
+    std::fs::remove_dir(junction).unwrap();
+}
+
+#[test]
+fn private_manifest_can_list_absolute_archives_with_spaces_and_unicode() {
+    let dir = TempDir::new("absolute-manifest");
+    let external = TempDir::new("external-archives");
+    let private = TempDir::new("private-config");
+    let base = external.join("game files 한글/base.grf");
+    let overlay = external.join("other volume/overlay.grf");
+    GrfBuilder::new()
+        .file("data\\shared.txt", b"base")
+        .write_v200(&base);
+    GrfBuilder::new()
+        .file("data\\shared.txt", b"overlay")
+        .write_v200(&overlay);
+    std::fs::create_dir_all(dir.join("resources")).unwrap();
+    private.write(
+        "DATA.INI",
+        format!("[Data]\n0={}\n1={}\n", overlay.display(), base.display()).as_bytes(),
+    );
+    let client = client_for(
+        &dir.path,
+        &[("CLIENT_DATAINI", private.join("DATA.INI").to_str().unwrap())],
+    );
+    assert_eq!(
+        &*client.resolve("data/shared.txt").unwrap().0.data,
+        b"overlay"
+    );
+    assert!(!dir.join("resources/base.grf").exists());
+    assert!(client.resolve("DATA.INI").is_none());
+    assert!(client.resolve("resources/data.grf").is_none());
+}
+
 fn fixture() -> TempDir {
     let dir = TempDir::new("resolution");
     GrfBuilder::new()
