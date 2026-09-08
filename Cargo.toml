@@ -30,6 +30,10 @@ regex-lite = "0.1"
 percent-encoding = "2"
 bytes = "1"
 httpdate = "1"
+# Managed-process requests are authenticated without sending the secret to a
+# potentially reused control port. Use audited primitives, not custom crypto.
+hmac = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process", "fs"] }

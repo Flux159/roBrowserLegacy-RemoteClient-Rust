@@ -171,21 +171,18 @@ async fn head_returns_the_headers_without_the_body() {
 }
 
 #[tokio::test]
-async fn health_reports_validation_plus_live_counters() {
+async fn health_is_minimal_and_does_not_disclose_local_paths() {
     let (_dir, server) = server(&[]).await;
-    // Touch an asset so the counters are not all zero.
-    request(server.addr, "GET", "/data/hello.txt", &[], None).await;
-
     let response = request(server.addr, "GET", "/api/health", &[], None).await;
     assert_eq!(response.status, 200);
-
-    let body = response.json();
-    assert_eq!(body["status"], "ok");
-    assert_eq!(body["index"]["grfCount"], 1);
-    assert_eq!(body["index"]["uniqueFiles"], 4);
-    assert!(body["cache"]["size"].as_u64().unwrap() >= 1);
-    assert!(body["missingFiles"]["total"].as_u64().is_some());
-    assert_eq!(body["esrgan"]["enabled"], false);
+    assert_eq!(response.header("cache-control"), Some("no-store"));
+    assert_eq!(
+        response.json(),
+        json!({
+            "status": "ok", "service": "robrowser-remoteclient",
+            "version": env!("CARGO_PKG_VERSION"),
+        })
+    );
 }
 
 #[tokio::test]
