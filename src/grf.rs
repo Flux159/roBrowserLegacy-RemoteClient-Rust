@@ -6,6 +6,7 @@
 
 use std::fs::File;
 use std::io::{self, Read};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use flate2::read::ZlibDecoder;
@@ -28,6 +29,15 @@ const FILE_TABLE_HEADER_SIZE: u64 = 8;
 const FILELIST_TYPE_FILE: u8 = 0x01;
 const FILELIST_TYPE_ENCRYPT_MIXED: u8 = 0x02;
 const FILELIST_TYPE_ENCRYPT_HEADER: u8 = 0x04;
+
+/// Biases Gravity added to two of the length fields in a 0x1xx file table.
+/// They are not checksums and they mean nothing; they are simply subtracted
+/// back off, as every reader of the format does.
+const LEGACY_LENGTH_BIAS: i64 = 715;
+const LEGACY_ALIGNED_BIAS: i64 = 37579;
+/// Fixed part of a 0x1xx entry: the three lengths, the type byte and the
+/// offset, all of which follow the filename block.
+const LEGACY_ENTRY_DATA_SIZE: usize = 17;
 
 /// Matches the reference loader's guardrails, so an archive that loads there
 /// loads here and one that is rejected there is rejected here.
@@ -99,7 +109,7 @@ impl std::fmt::Display for GrfError {
             GrfError::InvalidSignature(s) => write!(f, "Invalid signature: \"{s}\""),
             GrfError::UnsupportedVersion(v) => write!(
                 f,
-                "Version 0x{v:X} is not supported (expected: 0x200 or 0x300)"
+                "Version 0x{v:X} is not supported (expected: 0x1xx, 0x200 or 0x300)"
             ),
             GrfError::LimitExceeded(s) => write!(f, "{s}"),
             GrfError::CorruptTable(s) => write!(f, "{s}"),
@@ -171,9 +181,6 @@ fn parse_header(bytes: &[u8]) -> Result<Header, GrfError> {
     }
 
     let version = u32_le(bytes, 42);
-    if version != 0x200 && version != 0x300 {
-        return Err(GrfError::UnsupportedVersion(version));
-    }
 
     let parse_200 = |bytes: &[u8]| {
         let table_offset = u32_le(bytes, 30) as u64 + HEADER_SIZE;
@@ -181,6 +188,22 @@ fn parse_header(bytes: &[u8]) -> Result<Header, GrfError> {
         let count = u32_le(bytes, 38) as i64 - reserved - 7;
         (table_offset, count.max(0) as u64)
     };
+
+    // 0x1xx puts the same three fields in the same three places; only the
+    // file table itself is laid out differently.  Accept the whole range,
+    // because the client and rAthena both switch on the major byte alone.
+    if version >> 8 == 0x01 {
+        let (file_table_offset, file_count) = parse_200(bytes);
+        return Ok(Header {
+            version,
+            file_table_offset,
+            file_count,
+        });
+    }
+
+    if version != 0x200 && version != 0x300 {
+        return Err(GrfError::UnsupportedVersion(version));
+    }
 
     if version == 0x200 {
         let (file_table_offset, file_count) = parse_200(bytes);
@@ -227,23 +250,194 @@ fn parse_header(bytes: &[u8]) -> Result<Header, GrfError> {
 /// read anyway, so this samples names that actually carry high bytes wherever
 /// they are.  On an archive where the reference guesses right, this agrees with
 /// it; where it guesses blind, this does not.
-fn sample_names(data: &[u8], file_count: u64, entry_data_size: usize) -> Vec<&[u8]> {
-    let mut samples = Vec::new();
-    let mut pos = 0usize;
-    for _ in 0..file_count {
-        if pos >= data.len() || samples.len() >= DETECT_SAMPLE_COUNT {
-            break;
+fn sample_names<'a>(data: &'a [u8], entries: &[(Range<usize>, GrfEntry)]) -> Vec<&'a [u8]> {
+    entries
+        .iter()
+        .map(|(name, _)| &data[name.clone()])
+        .filter(|name| name.iter().any(|&b| b > 0x7F))
+        .take(DETECT_SAMPLE_COUNT)
+        .collect()
+}
+
+/// Walk a decompressed 0x200/0x300 file table.
+///
+/// Names are NUL-terminated and stored in the clear; the fixed-size entry data
+/// follows each one.  0x300 widens the offset to 64 bits and nothing else.
+fn read_modern_table(
+    data: &[u8],
+    file_count: u64,
+    version: u32,
+) -> Result<Vec<(Range<usize>, GrfEntry)>, GrfError> {
+    let entry_data_size = if version == 0x300 { 21 } else { 17 };
+    let mut out = Vec::with_capacity(file_count as usize);
+    let mut p = 0usize;
+
+    for i in 0..file_count {
+        if p >= data.len() {
+            return Err(GrfError::CorruptTable(format!(
+                "Unexpected end of file table at entry {i}"
+            )));
         }
-        let mut end = pos;
+
+        let mut end = p;
         while end < data.len() && data[end] != 0 {
             end += 1;
         }
-        if data[pos..end].iter().any(|&b| b > 0x7F) {
-            samples.push(&data[pos..end]);
+        let name = p..end;
+        p = end + 1;
+
+        if p + entry_data_size > data.len() {
+            return Err(GrfError::CorruptTable(format!(
+                "Incomplete entry data at entry {i}"
+            )));
         }
-        pos = end + 1 + entry_data_size;
+
+        let entry = GrfEntry {
+            compressed_size: u32_le(data, p),
+            length_aligned: u32_le(data, p + 4),
+            real_size: u32_le(data, p + 8),
+            kind: data[p + 12],
+            offset: if version == 0x300 {
+                let low = u32_le(data, p + 13) as u64;
+                let high = u32_le(data, p + 17) as u64;
+                (high << 32) + low
+            } else {
+                u32_le(data, p + 13) as u64
+            },
+        };
+        p += entry_data_size;
+        out.push((name, entry));
     }
-    samples
+
+    Ok(out)
+}
+
+/// Undo the filename obfuscation on a 0x1xx entry, in place.
+///
+/// Each 8-byte block is nibble-swapped and then put through the same one-round
+/// transform the entry bodies use.  A trailing block that does not fit is left
+/// alone rather than read past the end of the table.
+fn decode_filename(buf: &mut [u8], len: usize) {
+    let mut at = 0usize;
+    while at < len && at + 8 <= buf.len() {
+        let block = &mut buf[at..at + 8];
+        for byte in block.iter_mut() {
+            *byte = byte.rotate_right(4);
+        }
+        des::decode_header(block, 8);
+        at += 8;
+    }
+}
+
+/// Which encryption mode a 0x1xx entry was written with.
+///
+/// The format records no flag for it: every file is encrypted, and the client
+/// picks the mode from the extension, so a reader has to do the same.  These
+/// four are the ones Gravity streamed rather than decrypted whole.
+fn is_full_encrypt(name: &[u8]) -> bool {
+    const HEADER_ONLY: [&[u8; 4]; 4] = [b".gnd", b".gat", b".act", b".str"];
+    match name.iter().rposition(|&b| b == b'.') {
+        Some(dot) => {
+            let ext = &name[dot..];
+            !HEADER_ONLY.iter().any(|candidate| {
+                ext.len() == candidate.len()
+                    && ext
+                        .iter()
+                        .zip(candidate.iter())
+                        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+            })
+        }
+        None => true,
+    }
+}
+
+/// Walk a 0x1xx file table, decoding filenames in place.
+///
+/// The table is stored in the clear at the end of the archive, and each entry
+/// is a length-prefixed obfuscated filename followed by the fixed data:
+///
+/// ```text
+/// u32 name_block_len      whole block, filename included
+/// u16 (unused)
+/// ..  filename, nibble-swapped and transformed in 8-byte blocks
+/// u32 compressed_size + real_size + 715
+/// u32 length_aligned + 37579
+/// u32 real_size
+/// u8  type
+/// u32 offset
+/// ```
+///
+/// This is rAthena's `grfio.cpp` reading, field for field, including taking
+/// the filename's length from the low byte of the block length.
+fn read_legacy_table(
+    data: &mut [u8],
+    file_count: u64,
+) -> Result<Vec<(Range<usize>, GrfEntry)>, GrfError> {
+    let mut out = Vec::with_capacity(file_count as usize);
+    let mut p = 0usize;
+
+    for i in 0..file_count {
+        if p + 4 > data.len() {
+            return Err(GrfError::CorruptTable(format!(
+                "Unexpected end of file table at entry {i}"
+            )));
+        }
+
+        let block_len = u32_le(data, p) as usize;
+        let name_len = (data[p] as usize).saturating_sub(6);
+        let meta = match p.checked_add(4).and_then(|at| at.checked_add(block_len)) {
+            Some(meta) if meta + LEGACY_ENTRY_DATA_SIZE <= data.len() => meta,
+            _ => {
+                return Err(GrfError::CorruptTable(format!(
+                    "Incomplete entry data at entry {i}"
+                )))
+            }
+        };
+
+        let name_start = p + 6;
+        if name_start + name_len > meta {
+            return Err(GrfError::CorruptTable(format!(
+                "Filename runs past its own entry at entry {i}"
+            )));
+        }
+        decode_filename(&mut data[name_start..meta], name_len);
+        let name_end = data[name_start..name_start + name_len]
+            .iter()
+            .position(|&b| b == 0)
+            .map_or(name_start + name_len, |at| name_start + at);
+
+        let real_size = u32_le(data, meta + 8);
+        let compressed_size = u32_le(data, meta) as i64 - real_size as i64 - LEGACY_LENGTH_BIAS;
+        let length_aligned = u32_le(data, meta + 4) as i64 - LEGACY_ALIGNED_BIAS;
+        let mut kind = data[meta + 12];
+
+        // A length the biases underflow is not a file anyone can read. Drop the
+        // file bit rather than the entry, so the name still reaches encoding
+        // detection and the startup report still counts it.
+        if compressed_size < 0 || length_aligned < 0 {
+            kind &= !FILELIST_TYPE_FILE;
+        } else if kind & FILELIST_TYPE_FILE != 0 {
+            kind |= if is_full_encrypt(&data[name_start..name_end]) {
+                FILELIST_TYPE_ENCRYPT_MIXED
+            } else {
+                FILELIST_TYPE_ENCRYPT_HEADER
+            };
+        }
+
+        out.push((
+            name_start..name_end,
+            GrfEntry {
+                offset: u32_le(data, meta + 13) as u64,
+                compressed_size: compressed_size.max(0) as u32,
+                length_aligned: length_aligned.max(0) as u32,
+                real_size,
+                kind,
+            },
+        ));
+        p = meta + LEGACY_ENTRY_DATA_SIZE;
+    }
+
+    Ok(out)
 }
 
 impl Grf {
@@ -273,102 +467,103 @@ impl Grf {
         let table_skip: u64 = if header.version == 0x300 { 4 } else { 0 };
         let table_pos = header.file_table_offset + table_skip;
 
-        let table_header = read_at(&handle, table_pos, FILE_TABLE_HEADER_SIZE as usize)?;
-        let compressed_size = u32_le(&table_header, 0);
-        let real_size = u32_le(&table_header, 4);
+        // 0x1xx keeps its file table in the clear, running from here to the end
+        // of the archive with no size header in front of it. 0x200 and 0x300
+        // compress it behind one.
+        let legacy = header.version >> 8 == 0x01;
 
-        if compressed_size == 0 || real_size == 0 {
-            return Err(GrfError::CorruptTable(
-                "Invalid file table sizes (0)".into(),
-            ));
-        }
-        if real_size as u64 > MAX_FILE_TABLE_BYTES {
-            return Err(GrfError::CorruptTable(format!(
-                "Uncompressed file table too large ({real_size} bytes)"
-            )));
-        }
-        // A length out of a corrupt header would otherwise be believed all the
-        // way to a multi-gigabyte allocation that the read then fails anyway.
-        if table_pos + FILE_TABLE_HEADER_SIZE + compressed_size as u64 > size {
-            return Err(GrfError::CorruptTable(format!(
-                "File table runs past the end of the archive ({compressed_size} bytes at {table_pos})"
-            )));
-        }
+        let (mut data, compressed_size, real_size) = if legacy {
+            if table_pos > size {
+                return Err(GrfError::CorruptTable(format!(
+                    "File table starts past the end of the archive (at {table_pos})"
+                )));
+            }
+            let length = size - table_pos;
+            if length == 0 {
+                return Err(GrfError::CorruptTable("Empty file table".into()));
+            }
+            if length > MAX_FILE_TABLE_BYTES {
+                return Err(GrfError::CorruptTable(format!(
+                    "Uncompressed file table too large ({length} bytes)"
+                )));
+            }
+            let data = read_at(&handle, table_pos, length as usize)?;
+            (data, length as u32, length as u32)
+        } else {
+            let table_header = read_at(&handle, table_pos, FILE_TABLE_HEADER_SIZE as usize)?;
+            let compressed_size = u32_le(&table_header, 0);
+            let real_size = u32_le(&table_header, 4);
 
-        let compressed = read_at(
-            &handle,
-            table_pos + FILE_TABLE_HEADER_SIZE,
-            compressed_size as usize,
-        )?;
+            if compressed_size == 0 || real_size == 0 {
+                return Err(GrfError::CorruptTable(
+                    "Invalid file table sizes (0)".into(),
+                ));
+            }
+            if real_size as u64 > MAX_FILE_TABLE_BYTES {
+                return Err(GrfError::CorruptTable(format!(
+                    "Uncompressed file table too large ({real_size} bytes)"
+                )));
+            }
+            // A length out of a corrupt header would otherwise be believed all
+            // the way to a multi-gigabyte allocation that the read then fails
+            // anyway.
+            if table_pos + FILE_TABLE_HEADER_SIZE + compressed_size as u64 > size {
+                return Err(GrfError::CorruptTable(format!(
+                    "File table runs past the end of the archive ({compressed_size} bytes at {table_pos})"
+                )));
+            }
 
-        let mut data = Vec::with_capacity(real_size as usize);
-        ZlibDecoder::new(&compressed[..])
-            .read_to_end(&mut data)
-            .map_err(|e| GrfError::CorruptTable(format!("Failed to decompress file table: {e}")))?;
+            let compressed = read_at(
+                &handle,
+                table_pos + FILE_TABLE_HEADER_SIZE,
+                compressed_size as usize,
+            )?;
 
-        if data.len() != real_size as usize {
-            return Err(GrfError::CorruptTable(format!(
-                "File table size mismatch: expected {}, got {}",
-                real_size,
-                data.len()
-            )));
-        }
+            let mut data = Vec::with_capacity(real_size as usize);
+            ZlibDecoder::new(&compressed[..])
+                .read_to_end(&mut data)
+                .map_err(|e| {
+                    GrfError::CorruptTable(format!("Failed to decompress file table: {e}"))
+                })?;
 
-        let entry_data_size = if header.version == 0x300 { 21 } else { 17 };
+            if data.len() != real_size as usize {
+                return Err(GrfError::CorruptTable(format!(
+                    "File table size mismatch: expected {}, got {}",
+                    real_size,
+                    data.len()
+                )));
+            }
+            (data, compressed_size, real_size)
+        };
+
+        let entries = if legacy {
+            read_legacy_table(&mut data, header.file_count)?
+        } else {
+            read_modern_table(&data, header.file_count, header.version)?
+        };
+
         let detected_encoding = match forced_encoding {
             Some(encoding) => encoding,
             None => {
-                let samples = sample_names(&data, header.file_count, entry_data_size);
+                let samples = sample_names(&data, &entries);
                 detect_best_encoding(&samples, AUTO_DETECT_THRESHOLD)
             }
         };
 
-        let mut files: Vec<GrfFile> = Vec::with_capacity(header.file_count as usize);
+        let mut files: Vec<GrfFile> = Vec::with_capacity(entries.len());
         let mut bad_name_count = 0usize;
         let mut non_utf8_name_count = 0usize;
         let mut non_utf8_samples: Vec<String> = Vec::new();
         let mut encrypted_count = 0usize;
 
-        let mut p = 0usize;
-        for i in 0..header.file_count {
-            if p >= data.len() {
-                return Err(GrfError::CorruptTable(format!(
-                    "Unexpected end of file table at entry {i}"
-                )));
-            }
-
-            let mut end = p;
-            while end < data.len() && data[end] != 0 {
-                end += 1;
-            }
-            let raw_name = &data[p..end];
-            p = end + 1;
-
-            if p + entry_data_size > data.len() {
-                return Err(GrfError::CorruptTable(format!(
-                    "Incomplete entry data at entry {i}"
-                )));
-            }
-
-            let compressed_size = u32_le(&data, p);
-            let length_aligned = u32_le(&data, p + 4);
-            let real_size = u32_le(&data, p + 8);
-            let kind = data[p + 12];
-            let offset = if header.version == 0x300 {
-                let low = u32_le(&data, p + 13) as u64;
-                let high = u32_le(&data, p + 17) as u64;
-                (high << 32) + low
-            } else {
-                u32_le(&data, p + 13) as u64
-            };
-            p += entry_data_size;
-
-            if real_size > MAX_FILE_UNCOMPRESSED_BYTES {
+        for (name_range, entry) in entries {
+            if entry.real_size > MAX_FILE_UNCOMPRESSED_BYTES {
                 continue;
             }
-            if kind & FILELIST_TYPE_FILE == 0 {
+            if entry.kind & FILELIST_TYPE_FILE == 0 {
                 continue;
             }
+            let raw_name = &data[name_range];
 
             // Non-UTF-8 names are the norm for kRO archives.  Reported, not
             // treated as an error — this is what the startup report shows so
@@ -385,13 +580,6 @@ impl Grf {
                 bad_name_count += 1;
             }
 
-            let entry = GrfEntry {
-                offset,
-                compressed_size,
-                length_aligned,
-                real_size,
-                kind,
-            };
             if entry.is_encrypted() {
                 encrypted_count += 1;
             }
@@ -533,11 +721,60 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_versions() {
-        let b = header_bytes(0x103, 0, 0, 10);
+        let b = header_bytes(0x400, 0, 0, 10);
         assert!(matches!(
             parse_header(&b),
-            Err(GrfError::UnsupportedVersion(0x103))
+            Err(GrfError::UnsupportedVersion(0x400))
         ));
+    }
+
+    #[test]
+    fn parses_every_0x1xx_header_like_a_0x200_one() {
+        // The client and rAthena both switch on the major byte alone, and the
+        // three header fields sit where 0x200 puts them.
+        for version in [0x100, 0x101, 0x102, 0x103] {
+            let h = parse_header(&header_bytes(version, 1000, 0, 110)).unwrap();
+            assert_eq!(h.version, version);
+            assert_eq!(h.file_table_offset, 1000 + 46);
+            assert_eq!(h.file_count, 103);
+        }
+    }
+
+    #[test]
+    fn the_encryption_mode_of_a_0x1xx_entry_comes_from_its_extension() {
+        for streamed in ["data\\prontera.gnd", "data\\a.GAT", "x.act", "x.str"] {
+            assert!(
+                !is_full_encrypt(streamed.as_bytes()),
+                "{streamed} is header-encrypted"
+            );
+        }
+        for whole in ["data\\prontera.rsw", "a.bmp", "data\\noextension"] {
+            assert!(
+                is_full_encrypt(whole.as_bytes()),
+                "{whole} is fully encrypted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_0x1xx_filename_round_trips_through_the_obfuscation() {
+        // The transform is its own inverse applied in the opposite order, which
+        // is what the test archive writer relies on.
+        let mut buf = *b"data\\prontera.rsw\0\0\0\0\0\0";
+        let original = buf;
+        let len = buf.len() & !7;
+        decode_filename(&mut buf, len);
+        assert_ne!(buf[..len], original[..len]);
+        // Encoding is the same two steps in the other order.
+        let mut at = 0;
+        while at + 8 <= len {
+            des::decode_header(&mut buf[at..at + 8], 8);
+            for byte in &mut buf[at..at + 8] {
+                *byte = byte.rotate_right(4);
+            }
+            at += 8;
+        }
+        assert_eq!(buf, original);
     }
 
     #[test]

@@ -31,6 +31,28 @@ fn deflate(data: &[u8]) -> Vec<u8> {
     encoder.finish().unwrap()
 }
 
+/// The 0x1xx filename obfuscation, in the writing direction: the same one-round
+/// transform the bodies use, then a nibble swap.  Reading is the two steps in
+/// the other order, which is what makes this its inverse.
+fn encode_filename(name: &mut [u8]) {
+    let mut at = 0usize;
+    while at + 8 <= name.len() {
+        robrowser_remoteclient::des::encode_header(&mut name[at..at + 8], 8);
+        for byte in &mut name[at..at + 8] {
+            *byte = byte.rotate_right(4);
+        }
+        at += 8;
+    }
+}
+
+/// A 0x1xx entry records no encryption flag; the extension picks the mode.
+fn full_encrypt(name: &[u8]) -> bool {
+    let lower: Vec<u8> = name.to_ascii_lowercase();
+    ![b".gnd", b".gat", b".act", b".str"]
+        .iter()
+        .any(|ext| lower.ends_with(*ext))
+}
+
 pub struct Entry {
     /// Raw name bytes, exactly as they will sit in the file table.
     pub name: Vec<u8>,
@@ -116,6 +138,84 @@ impl GrfBuilder {
     /// this writes some to keep the test honest about what has to be ignored.
     pub fn write_v300_event_horizon(&self, path: &Path) {
         self.write_signed(path, 0x300, b"Event Horizon\0c\0");
+    }
+
+    /// A 0x102 archive: the format the pre-2004 clients wrote, and what a
+    /// LATAM client's `event.grf` still is.
+    ///
+    /// Its file table is stored in the clear at the end of the archive with no
+    /// size header, the filenames in it are obfuscated, and every entry is
+    /// encrypted — there are no per-entry flags to say so, the extension
+    /// decides which of the two modes was used.
+    pub fn write_v102(&self, path: &Path) {
+        let mut body: Vec<u8> = Vec::new();
+        let mut table: Vec<u8> = Vec::new();
+
+        for entry in &self.entries {
+            let is_file = entry.flags & FILELIST_TYPE_FILE != 0;
+            let mut payload = deflate(&entry.data);
+            let offset = body.len() as u32;
+            let compressed_size = payload.len() as u32;
+            let real_size = entry.data.len() as u32;
+            let length_aligned = (compressed_size + 7) & !7;
+            payload.resize(length_aligned as usize, 0);
+
+            let mut kind = entry.flags;
+            if is_file {
+                if full_encrypt(&entry.name) {
+                    kind |= FILELIST_TYPE_ENCRYPT_MIXED;
+                    robrowser_remoteclient::des::encode_full(
+                        &mut payload,
+                        length_aligned as usize,
+                        compressed_size,
+                    );
+                } else {
+                    kind |= FILELIST_TYPE_ENCRYPT_HEADER;
+                    robrowser_remoteclient::des::encode_header(
+                        &mut payload,
+                        length_aligned as usize,
+                    );
+                }
+                body.extend_from_slice(&payload);
+            }
+
+            // The name is NUL-terminated and padded out to whole 8-byte
+            // blocks, because that is the unit the obfuscation works in.
+            let mut name = entry.name.clone();
+            name.push(0);
+            while name.len() % 8 != 0 {
+                name.push(0);
+            }
+            encode_filename(&mut name);
+
+            // [block length][2 unused][name][4 unused], then the fixed data.
+            let block_len = name.len() as u32 + 6;
+            table.extend_from_slice(&block_len.to_le_bytes());
+            table.extend_from_slice(&[0u8; 2]);
+            table.extend_from_slice(&name);
+            table.extend_from_slice(&[0u8; 4]);
+            table.extend_from_slice(&(compressed_size + real_size + 715).to_le_bytes());
+            table.extend_from_slice(&(length_aligned + 37579).to_le_bytes());
+            table.extend_from_slice(&real_size.to_le_bytes());
+            table.push(kind);
+            table.extend_from_slice(&offset.to_le_bytes());
+        }
+
+        let mut header = vec![0u8; 46];
+        header[0..15].copy_from_slice(b"Master of Magic");
+        header[30..34].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        header[34..38].copy_from_slice(&0u32.to_le_bytes()); // seed
+        header[38..42].copy_from_slice(&(self.entries.len() as u32 + 7).to_le_bytes());
+        header[42..46].copy_from_slice(&0x102u32.to_le_bytes());
+
+        let mut out = header;
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&table);
+
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(path, out).unwrap();
     }
 
     fn write(&self, path: &Path, version: u32) {

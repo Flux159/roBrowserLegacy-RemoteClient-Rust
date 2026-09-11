@@ -46,6 +46,58 @@ fn reads_a_v200_archive() {
 }
 
 #[test]
+fn reads_a_v102_archive() {
+    // The format a LATAM client's event.grf is written in: an uncompressed
+    // file table at the end of the archive, obfuscated filenames, and every
+    // entry encrypted with the mode its extension implies.
+    let dir = TempDir::new("grf-v102");
+    let path = dir.join("event.grf");
+    GrfBuilder::new()
+        .file("data\\plain.txt", b"plain contents")
+        .file(KOREAN_PATH, b"korean act payload")
+        .file(UI_PATH, &vec![0x42u8; 4096])
+        // .gnd and .gat are the streamed extensions: header encryption, not
+        // the full mix. Both paths have to come back intact.
+        .file("data\\prontera.gnd", &vec![0x37u8; 8192])
+        .file("data\\prontera.rsw", b"GRSW fully encrypted payload")
+        .directory("data\\somedir")
+        .write_v102(&path);
+
+    let grf = Grf::open(&path).unwrap();
+    assert_eq!(grf.version, 0x102);
+    assert_eq!(grf.files.len(), 5);
+    assert_eq!(grf.stats.detected_encoding.as_str(), "cp949");
+    // Nothing in this format is stored in the clear.
+    assert_eq!(grf.stats.encrypted_count, 5);
+
+    let read = |name: &str| {
+        let file = grf.files.iter().find(|f| f.name == name).unwrap();
+        grf.read_entry(&file.entry).unwrap()
+    };
+    assert_eq!(read("data\\plain.txt"), b"plain contents");
+    assert_eq!(read(KOREAN_PATH), b"korean act payload");
+    assert_eq!(read(UI_PATH), vec![0x42u8; 4096]);
+    assert_eq!(read("data\\prontera.gnd"), vec![0x37u8; 8192]);
+    assert_eq!(read("data\\prontera.rsw"), b"GRSW fully encrypted payload");
+}
+
+#[test]
+fn a_v102_archive_serves_through_the_index() {
+    let dir = TempDir::new("grf-v102-index");
+    let path = dir.join("event.grf");
+    GrfBuilder::new()
+        .file(KOREAN_PATH, b"korean act payload")
+        .write_v102(&path);
+
+    let grf = Grf::open(&path).unwrap();
+    let index = AssetIndex::build(&[grf]);
+    // The client asks for the mojibake spelling; the archive stores CP949.
+    assert!(index
+        .lookup(&to_mojibake(KOREAN_PATH).to_lowercase())
+        .is_some());
+}
+
+#[test]
 fn reads_a_v300_archive() {
     let dir = TempDir::new("grf-v300");
     let path = dir.join("test.grf");
