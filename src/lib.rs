@@ -4,6 +4,7 @@
 //! public so the integration tests can drive the real router, the real index
 //! and the real GRF reader rather than a stand-in for them.
 
+pub mod appproxy;
 pub mod cache;
 pub mod client;
 pub mod config;

@@ -55,6 +55,13 @@ pub fn router(state: AppState) -> Router {
         router = router.route("/ws/{*target}", get(ws_upgrade));
     }
 
+    if let Some((prefix, _)) = state.cfg.app_proxy.clone() {
+        router = router.route(
+            &format!("{prefix}{{*rest}}"),
+            axum::routing::any(crate::appproxy::forward),
+        );
+    }
+
     router
         .fallback(serve_path)
         .layer(axum::middleware::from_fn_with_state(
