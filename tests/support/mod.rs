@@ -406,6 +406,8 @@ pub fn config_for(root: &Path, overrides: &[(&str, &str)]) -> Config {
         "CLIENT_ENABLESEARCH",
         "CLIENT_AUTOEXTRACT",
         "GRF_FILENAME_ENCODING",
+        "APP_PROXY_PREFIX",
+        "APP_PROXY_TARGET",
     ];
     for key in managed {
         std::env::remove_var(key);
@@ -444,7 +446,11 @@ impl TestServer {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
         });
         TestServer {
             addr,

@@ -669,3 +669,145 @@ async fn the_clients_own_url_shape_resolves() {
     assert_eq!(response.status, 200);
     assert_eq!(response.body, vec![0x22u8; 3000]);
 }
+
+/// A one-shot loopback "app": records the request it is sent and answers
+/// with `reply`.
+async fn fake_app(reply: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap().to_string();
+    let handle = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut seen = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            seen.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&seen).to_string();
+            if let Some(end) = text.find("\r\n\r\n") {
+                let length = text
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if seen.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            if n == 0 {
+                break;
+            }
+        }
+        stream.write_all(reply.as_bytes()).await.unwrap();
+        String::from_utf8_lossy(&seen).to_string()
+    });
+    (target, handle)
+}
+
+#[tokio::test]
+async fn a_configured_prefix_is_forwarded_to_the_loopback_app_and_nothing_else_is() {
+    let (target, app) = fake_app("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: ro-remember-3338=x; Path=/_friend/remember/; HttpOnly; SameSite=Strict\r\nX-Internal: secret\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}").await;
+    let (_dir, server) = server(&[
+        ("APP_PROXY_PREFIX", "/_friend/remember/"),
+        ("APP_PROXY_TARGET", &target),
+    ])
+    .await;
+    let response = request(
+        server.addr,
+        "POST",
+        "/_friend/remember/status",
+        &[
+            ("Origin", "http://192.168.1.20:3338"),
+            ("Cookie", "ro-remember-3338=abc"),
+            ("Content-Type", "application/json"),
+            ("X-Forwarded-For", "1.2.3.4"),
+        ],
+        Some(b"{}"),
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"{\"ok\":true}");
+    assert!(response
+        .header("set-cookie")
+        .unwrap()
+        .starts_with("ro-remember-3338=x"));
+    assert_eq!(response.header("x-internal"), None);
+    let seen = app.await.unwrap();
+    assert!(
+        seen.starts_with("POST /_friend/remember/status HTTP/1.1\r\n"),
+        "{seen}"
+    );
+    assert!(
+        seen.contains("origin: http://192.168.1.20:3338\r\n"),
+        "{seen}"
+    );
+    assert!(seen.contains("cookie: ro-remember-3338=abc\r\n"), "{seen}");
+    // The peer this server saw, never the one the client claimed.
+    assert!(seen.contains("X-Forwarded-For: 127.0.0.1\r\n"), "{seen}");
+    assert!(!seen.contains("1.2.3.4"), "{seen}");
+    assert!(seen.ends_with("\r\n\r\n{}"), "{seen}");
+
+    // Only POST; and an app that is not listening is a 502, not a hang.
+    assert_eq!(
+        request(server.addr, "GET", "/_friend/remember/status", &[], None)
+            .await
+            .status,
+        405
+    );
+    let too_big = vec![b'x'; 5000];
+    assert_eq!(
+        request(
+            server.addr,
+            "POST",
+            "/_friend/remember/status",
+            &[],
+            Some(&too_big)
+        )
+        .await
+        .status,
+        413
+    );
+}
+
+#[tokio::test]
+async fn without_both_settings_or_with_an_outside_target_nothing_is_forwarded() {
+    for overrides in [
+        vec![("APP_PROXY_PREFIX", "/_friend/remember/")],
+        vec![
+            ("APP_PROXY_PREFIX", "/_friend/remember/"),
+            ("APP_PROXY_TARGET", "192.168.1.5:80"),
+        ],
+        vec![
+            ("APP_PROXY_PREFIX", "/api/"),
+            ("APP_PROXY_TARGET", "127.0.0.1:9"),
+        ],
+    ] {
+        let (_dir, server) = server(&overrides).await;
+        assert_eq!(
+            request(server.addr, "GET", "/_friend/remember/status", &[], None)
+                .await
+                .status,
+            404
+        );
+    }
+    let (_dir, server) = server(&[
+        ("APP_PROXY_PREFIX", "/_friend/remember/"),
+        ("APP_PROXY_TARGET", "127.0.0.1:9"),
+    ])
+    .await;
+    assert_eq!(
+        request(
+            server.addr,
+            "POST",
+            "/_friend/remember/status",
+            &[],
+            Some(b"{}")
+        )
+        .await
+        .status,
+        502
+    );
+}

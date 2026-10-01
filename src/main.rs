@@ -239,6 +239,8 @@ async fn run() -> i32 {
         });
     };
 
+    // The peer address is what the app proxy names in X-Forwarded-For.
+    let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
     if let Err(e) = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await

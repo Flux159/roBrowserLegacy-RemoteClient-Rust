@@ -48,6 +48,9 @@ pub struct Config {
     /// default) is right almost always; this is the escape hatch for an archive
     /// it gets wrong.
     pub grf_filename_encoding: Option<FilenameEncoding>,
+    /// `APP_PROXY_PREFIX` + `APP_PROXY_TARGET`: a path prefix forwarded to a
+    /// loopback HTTP service (appproxy.rs). None unless both are set and valid.
+    pub app_proxy: Option<(String, String)>,
 }
 
 /// Resolve a path and make it absolute, without the `\\?\` prefix that
@@ -210,6 +213,15 @@ impl Config {
             grf_filename_encoding: match env("GRF_FILENAME_ENCODING").as_deref() {
                 Some("cp949") | Some("euc-kr") => Some(FilenameEncoding::Cp949),
                 Some("utf-8") | Some("utf8") => Some(FilenameEncoding::Utf8),
+                _ => None,
+            },
+            app_proxy: match (env("APP_PROXY_PREFIX"), env("APP_PROXY_TARGET")) {
+                (Some(prefix), Some(target))
+                    if crate::appproxy::valid_prefix(&prefix)
+                        && crate::appproxy::valid_target(&target) =>
+                {
+                    Some((prefix, target))
+                }
                 _ => None,
             },
         }
