@@ -811,3 +811,73 @@ async fn without_both_settings_or_with_an_outside_target_nothing_is_forwarded() 
         502
     );
 }
+
+#[tokio::test]
+async fn guild_emblems_go_to_the_web_server_and_nothing_else_does() {
+    let emblem = "HTTP/1.1 200 OK\r\nContent-Type: image/gif\r\nContent-Length: 6\r\nConnection: close\r\n\r\nGIF89a";
+    let (target, web) = fake_app(emblem).await;
+    let (_dir, server) = server(&[("WEB_SERVER_TARGET", &target)]).await;
+    // An emblem may be 50 KB, more than the app proxy's 4 KiB.
+    let form = vec![b'e'; 50_000];
+    let response = request(
+        server.addr,
+        "POST",
+        "/emblem/download",
+        &[("Content-Type", "multipart/form-data; boundary=x")],
+        Some(&form),
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.header("content-type"), Some("image/gif"));
+    assert_eq!(response.body, b"GIF89a");
+    let seen = web.await.unwrap();
+    assert!(
+        seen.starts_with("POST /emblem/download HTTP/1.1\r\n"),
+        "{seen}"
+    );
+    assert!(
+        seen.contains("content-type: multipart/form-data; boundary=x\r\n"),
+        "{seen}"
+    );
+
+    // Only the two emblem paths, only POST, and not more than 64 KiB.
+    assert_eq!(
+        request(server.addr, "GET", "/emblem/download", &[], None)
+            .await
+            .status,
+        405
+    );
+    // Any other web-server path is answered like any POST this server does not route.
+    assert_eq!(
+        request(server.addr, "POST", "/userconfig/load", &[], Some(b"{}"))
+            .await
+            .status,
+        request(server.addr, "POST", "/no/such/route", &[], Some(b"{}"))
+            .await
+            .status
+    );
+    let too_big = vec![b'x'; 70_000];
+    assert_eq!(
+        request(server.addr, "POST", "/emblem/upload", &[], Some(&too_big))
+            .await
+            .status,
+        413
+    );
+}
+
+#[tokio::test]
+async fn emblems_are_not_forwarded_without_a_loopback_web_server() {
+    for overrides in [vec![], vec![("WEB_SERVER_TARGET", "192.168.1.5:8888")]] {
+        let (_dir, server) = server(&overrides).await;
+        // Not routed: a missing file, as without this feature.
+        assert_eq!(
+            request(server.addr, "GET", "/emblem/download", &[], None)
+                .await
+                .status,
+            404
+        );
+    }
+    let (_dir, server) = server(&[("WEB_SERVER_TARGET", "127.0.0.1:9")]).await;
+    let response = request(server.addr, "POST", "/emblem/download", &[], Some(b"{}")).await;
+    assert_eq!(response.status, 502);
+}
