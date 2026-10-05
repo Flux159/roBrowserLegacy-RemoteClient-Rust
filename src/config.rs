@@ -51,6 +51,10 @@ pub struct Config {
     /// `APP_PROXY_PREFIX` + `APP_PROXY_TARGET`: a path prefix forwarded to a
     /// loopback HTTP service (appproxy.rs). None unless both are set and valid.
     pub app_proxy: Option<(String, String)>,
+    /// `WEB_SERVER_TARGET`: rAthena's web-server, which keeps guild emblems;
+    /// `/emblem/upload` and `/emblem/download` go there (appproxy.rs). None
+    /// unless set to a loopback target.
+    pub web_server_proxy: Option<String>,
 }
 
 /// Resolve a path and make it absolute, without the `\\?\` prefix that
@@ -224,6 +228,8 @@ impl Config {
                 }
                 _ => None,
             },
+            web_server_proxy: env("WEB_SERVER_TARGET")
+                .filter(|target| crate::appproxy::valid_target(target)),
         }
     }
 

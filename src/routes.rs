@@ -62,6 +62,15 @@ pub fn router(state: AppState) -> Router {
         );
     }
 
+    if state.cfg.web_server_proxy.is_some() {
+        for path in crate::appproxy::WEB_SERVER_ROUTES {
+            router = router.route(
+                path,
+                axum::routing::any(crate::appproxy::forward_web_server),
+            );
+        }
+    }
+
     router
         .fallback(serve_path)
         .layer(axum::middleware::from_fn_with_state(
