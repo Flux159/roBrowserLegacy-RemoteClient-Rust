@@ -408,6 +408,7 @@ pub fn config_for(root: &Path, overrides: &[(&str, &str)]) -> Config {
         "GRF_FILENAME_ENCODING",
         "APP_PROXY_PREFIX",
         "APP_PROXY_TARGET",
+        "WEB_SERVER_TARGET",
     ];
     for key in managed {
         std::env::remove_var(key);
