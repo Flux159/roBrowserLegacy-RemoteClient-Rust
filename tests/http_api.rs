@@ -847,22 +847,35 @@ async fn guild_emblems_go_to_the_web_server_and_nothing_else_does() {
             .status,
         405
     );
-    // Any other web-server path is answered like any POST this server does not route.
+    // Any other web-server path is answered like any POST this server does not
+    // route. Without a body: one the server never reads can reset the socket
+    // before its reply is read (as below).
     assert_eq!(
-        request(server.addr, "POST", "/userconfig/load", &[], Some(b"{}"))
+        request(server.addr, "POST", "/userconfig/load", &[], None)
             .await
             .status,
-        request(server.addr, "POST", "/no/such/route", &[], Some(b"{}"))
+        request(server.addr, "POST", "/no/such/route", &[], None)
             .await
             .status
     );
-    let too_big = vec![b'x'; 70_000];
-    assert_eq!(
-        request(server.addr, "POST", "/emblem/upload", &[], Some(&too_big))
-            .await
-            .status,
-        413
-    );
+    // Refused on its Content-Length, before any body is read. So send only the
+    // headers and close our side: sending the body races the reply (a socket
+    // closed with unread data is reset, sometimes before the 413 is read), and
+    // leaving it open keeps the server waiting for a body it will never use.
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(server.addr).await.unwrap();
+        let head = format!(
+            "POST /emblem/upload HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: 70000\r\n\r\n",
+            server.addr
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).await.unwrap();
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(reply.starts_with("HTTP/1.1 413 "), "{reply}");
+    }
 }
 
 #[tokio::test]
