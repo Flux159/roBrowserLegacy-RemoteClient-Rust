@@ -171,6 +171,14 @@ async fn relay(
             if answer.len() > MAX_RESPONSE {
                 return Err(std::io::Error::other("response too large"));
             }
+            // The answer is whole once its Content-Length has arrived. The
+            // connection need not close then, despite `Connection: close`:
+            // rAthena's web-server, reached through the app's port forward,
+            // leaves it open, and reading on to the close would end in the
+            // timeout above with the answer already in hand.
+            if is_complete(&answer) {
+                break;
+            }
         }
         Ok::<_, std::io::Error>(answer)
     };
@@ -190,6 +198,27 @@ async fn relay(
             format!("{who} gave an unreadable answer"),
         )
     })
+}
+
+/// Whether `raw` holds a whole answer: its head, and as much body as its
+/// Content-Length says. One without a Content-Length is read to the close.
+fn is_complete(raw: &[u8]) -> bool {
+    let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let Ok(head) = std::str::from_utf8(&raw[..end]) else {
+        return false;
+    };
+    head.split("\r\n")
+        .skip(1)
+        .find_map(|l| {
+            let (name, value) = l.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .is_some_and(|length| raw.len() >= end + 4 + length)
 }
 
 /// An HTTP/1.x answer with a Content-Length (or read to close), reduced to the
@@ -238,6 +267,17 @@ pub fn parse_response(raw: &[u8]) -> Option<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_is_complete_once_its_content_length_is_in() {
+        let whole =
+            b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 5\r\n\r\nError";
+        assert!(is_complete(whole));
+        assert!(!is_complete(&whole[..whole.len() - 1]));
+        assert!(!is_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"));
+        // Without a length, only the close says it is over.
+        assert!(!is_complete(b"HTTP/1.1 200 OK\r\n\r\nabc"));
+    }
 
     #[test]
     fn only_tidy_prefixes_that_are_not_ours() {

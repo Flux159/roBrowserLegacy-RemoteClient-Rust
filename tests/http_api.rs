@@ -4,6 +4,7 @@ mod support;
 
 use robrowser_remoteclient::encoding::to_mojibake;
 use serde_json::json;
+use std::time::Duration;
 use support::{client_for, config_for, request, write_data_ini, GrfBuilder, TempDir, TestServer};
 
 const KOREAN: &str = "data\\texture\\유저인터페이스\\btn_ok.bmp";
@@ -673,6 +674,15 @@ async fn the_clients_own_url_shape_resolves() {
 /// A one-shot loopback "app": records the request it is sent and answers
 /// with `reply`.
 async fn fake_app(reply: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+    fake_app_holding(reply, Duration::ZERO).await
+}
+
+/// As `fake_app`, but keeping the connection open for `hold` after answering,
+/// as rAthena's web-server does through the app's port forward.
+async fn fake_app_holding(
+    reply: &'static str,
+    hold: Duration,
+) -> (String, tokio::task::JoinHandle<String>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target = listener.local_addr().unwrap().to_string();
@@ -702,6 +712,7 @@ async fn fake_app(reply: &'static str) -> (String, tokio::task::JoinHandle<Strin
             }
         }
         stream.write_all(reply.as_bytes()).await.unwrap();
+        tokio::time::sleep(hold).await;
         String::from_utf8_lossy(&seen).to_string()
     });
     (target, handle)
@@ -876,6 +887,29 @@ async fn guild_emblems_go_to_the_web_server_and_nothing_else_does() {
         let reply = String::from_utf8_lossy(&reply);
         assert!(reply.starts_with("HTTP/1.1 413 "), "{reply}");
     }
+}
+
+#[tokio::test]
+async fn an_emblem_answer_is_passed_on_without_waiting_for_the_close() {
+    let emblem = "HTTP/1.1 200 OK\r\nContent-Type: image/gif\r\nContent-Length: 6\r\nConnection: close\r\n\r\nGIF89a";
+    let (target, _web) = fake_app_holding(emblem, Duration::from_secs(30)).await;
+    let (_dir, server) = server(&[("WEB_SERVER_TARGET", &target)]).await;
+    let started = std::time::Instant::now();
+    let response = request(
+        server.addr,
+        "POST",
+        "/emblem/download",
+        &[],
+        Some(b"GDID=1"),
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"GIF89a");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
 }
 
 #[tokio::test]
