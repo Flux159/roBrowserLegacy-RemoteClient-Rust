@@ -306,10 +306,24 @@ fn read_modern_table(
             },
         };
         p += entry_data_size;
-        out.push((name, entry));
+        out.push((name, stored_as_file(entry)));
     }
 
     Ok(out)
+}
+
+/// A 0x200/0x300 entry GRF Editor stored without compressing it.
+///
+/// GRF Editor writes such an entry with a type of 0, which the format otherwise
+/// uses for a directory, and with equal packed and real sizes. iRO's 2026
+/// data.grf has 452 of them, all PNGs (NPC illustrations, the base footprint)
+/// that the official client draws. A directory has no content, so an entry of
+/// type 0 with some is read as a file.
+fn stored_as_file(mut entry: GrfEntry) -> GrfEntry {
+    if entry.kind == 0 && entry.real_size > 0 && entry.compressed_size == entry.real_size {
+        entry.kind = FILELIST_TYPE_FILE;
+    }
+    entry
 }
 
 /// Undo the filename obfuscation on a 0x1xx entry, in place.
@@ -698,6 +712,29 @@ mod tests {
         b[38..42].copy_from_slice(&n_files.to_le_bytes());
         b[42..46].copy_from_slice(&version.to_le_bytes());
         b
+    }
+
+    fn modern_entry(name: &str, packed: u32, real: u32, kind: u8) -> Vec<u8> {
+        let mut b = name.as_bytes().to_vec();
+        b.push(0);
+        b.extend_from_slice(&packed.to_le_bytes());
+        b.extend_from_slice(&packed.to_le_bytes());
+        b.extend_from_slice(&real.to_le_bytes());
+        b.push(kind);
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn an_entry_stored_uncompressed_with_type_0_is_a_file() {
+        let mut table = modern_entry("data\\texture\\effect\\footprint0.png", 4280, 4280, 0);
+        table.extend(modern_entry("data\\texture\\effect", 0, 0, 0));
+        table.extend(modern_entry("data\\a.png", 4138, 4280, 1));
+        let entries = read_modern_table(&table, 3, 0x200).unwrap();
+        let kinds: Vec<u8> = entries.iter().map(|(_, e)| e.kind).collect();
+        // The stored one is a file, the directory stays one, and a compressed
+        // file is untouched.
+        assert_eq!(kinds, [FILELIST_TYPE_FILE, 0, FILELIST_TYPE_FILE]);
     }
 
     #[test]
