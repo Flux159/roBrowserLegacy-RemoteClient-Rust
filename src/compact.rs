@@ -71,7 +71,9 @@ pub fn transcode(path: &str, data: &[u8], quality: u8) -> Option<Vec<u8>> {
         webp::Encoder::from_rgba(&rgba, width, height).encode_simple(false, quality)
     } else {
         let rgb: Vec<u8> = rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2]])
             .collect();
         webp::Encoder::from_rgb(&rgb, width, height).encode_simple(false, quality)
@@ -84,9 +86,9 @@ pub fn transcode(path: &str, data: &[u8], quality: u8) -> Option<Vec<u8>> {
 /// `Texture.removeMagenta` does; true when there was one.
 fn remove_magenta(rgba: &mut [u8]) -> bool {
     let mut any = false;
-    for p in rgba.chunks_exact_mut(4) {
+    for p in rgba.as_chunks_mut::<4>().0 {
         if p[0] > 230 && p[1] < 20 && p[2] > 230 {
-            p.copy_from_slice(&[0, 0, 0, 0]);
+            *p = [0; 4];
             any = true;
         }
     }
@@ -158,7 +160,7 @@ mod tests {
         assert_eq!(at(16, 16)[3], 0, "its edge too");
         assert_eq!(at(4, 4)[3], 255, "the rest stays opaque");
         // Nothing the client would key out again is left behind.
-        for p in px.chunks_exact(4).filter(|p| p[3] == 255) {
+        for p in px.as_chunks::<4>().0.iter().filter(|p| p[3] == 255) {
             assert!(!(p[0] > 230 && p[1] < 20 && p[2] > 230));
         }
     }
