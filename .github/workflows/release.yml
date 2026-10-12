@@ -29,9 +29,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Native runners for each target. The crate is pure Rust with no C
-          # dependencies, so this needs no cross toolchain — and building on the
-          # host it will run on avoids an entire class of linkage surprise.
+          # Native runners for each target. The only C is libwebp, which
+          # libwebp-sys builds with the runner's own compiler, so this needs no
+          # cross toolchain — and building on the host it will run on avoids an
+          # entire class of linkage surprise.
           - os: macos-latest
             triple: aarch64-apple-darwin
             target: aarch64-apple-darwin

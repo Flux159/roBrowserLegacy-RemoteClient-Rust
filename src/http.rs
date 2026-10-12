@@ -282,6 +282,26 @@ pub fn asset_response(
     }
 }
 
+/// The compact form of a picture (compact.rs), for a request that asked for
+/// it.  Cached like the original, under its own ETag.
+pub fn compact_response(etag: &str, body: &[u8]) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, "image/webp")
+        .header(ETAG, format!("\"{etag}\""))
+        .header(
+            CACHE_CONTROL,
+            format!("public, max-age={STATIC_MAX_AGE}, immutable"),
+        )
+        .header(
+            LAST_MODIFIED,
+            httpdate::fmt_http_date(std::time::SystemTime::now()),
+        )
+        .header(VARY, "Accept-Encoding, X-Compact-Images")
+        .body(Body::from(body.to_vec()))
+        .unwrap()
+}
+
 pub fn not_modified(etag: &str) -> Response {
     Response::builder()
         .status(StatusCode::NOT_MODIFIED)

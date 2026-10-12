@@ -4,11 +4,12 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::Serialize;
 
-use crate::cache::{CacheStats, CachedFile, FileCache};
+use crate::cache::{CacheStats, CachedFile, Encodings, FileCache};
+use crate::compact;
 use crate::config::Config;
 use crate::encoding::{decode_mojibake, js_lowercase, to_mojibake};
 use crate::grf::Grf;
@@ -234,7 +235,47 @@ impl Client {
         file: &CachedFile,
         coding: Coding,
     ) -> Option<Arc<Vec<u8>>> {
-        if let Some(done) = file.encodings.slot(coding).get() {
+        self.made(
+            req_path,
+            file,
+            move |e| e.slot(coding),
+            move |data| encode_asset(coding, data),
+        )
+        .await
+    }
+
+    /// `file` as a compact picture (compact.rs), made once and kept with the
+    /// cached entry like an encoding; `None` when that is not smaller.
+    pub async fn compacted(
+        self: &Arc<Self>,
+        req_path: &str,
+        file: &CachedFile,
+        quality: u8,
+    ) -> Option<Arc<Vec<u8>>> {
+        let path = req_path.to_string();
+        self.made(
+            req_path,
+            file,
+            |e| &e.compact,
+            move |data| compact::transcode(&path, data, quality),
+        )
+        .await
+    }
+
+    /// Fill one of `file`'s derived forms with `make` on the blocking pool,
+    /// once, and count it against the cache's memory budget.
+    async fn made<S, M>(
+        self: &Arc<Self>,
+        req_path: &str,
+        file: &CachedFile,
+        slot: S,
+        make: M,
+    ) -> Option<Arc<Vec<u8>>>
+    where
+        S: Fn(&Encodings) -> &OnceLock<Option<Arc<Vec<u8>>>> + Send + 'static,
+        M: FnOnce(&[u8]) -> Option<Vec<u8>> + Send + 'static,
+    {
+        if let Some(done) = slot(&file.encodings).get() {
             return done.clone();
         }
         let this = Arc::clone(self);
@@ -242,13 +283,11 @@ impl Client {
         let file = file.clone();
         tokio::task::spawn_blocking(move || {
             let mut made = None;
-            let result = file
-                .encodings
-                .slot(coding)
+            let result = slot(&file.encodings)
                 .get_or_init(|| {
-                    let encoded = encode_asset(coding, &file.data).map(Arc::new);
-                    made = encoded.as_ref().map(|e| e.len());
-                    encoded
+                    let bytes = make(&file.data).map(Arc::new);
+                    made = bytes.as_ref().map(|b| b.len());
+                    bytes
                 })
                 .clone();
             if let Some(bytes) = made {

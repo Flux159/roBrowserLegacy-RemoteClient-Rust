@@ -2,7 +2,7 @@
 name = "robrowser-remoteclient"
 version = "1.0.5"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 description = "Single-binary roBrowserLegacy Remote Client: static server, GRF asset server and WebSocket-to-TCP proxy"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/Flux159/roBrowserLegacy-RemoteClient-Rust"
@@ -37,6 +37,10 @@ sha2 = "0.10"
 # Brotli for game assets sent through the HTTPS sharing tunnel, where
 # browsers offer it. Pure Rust, like flate2's backend.
 brotli = { version = "8", default-features = false, features = ["std"] }
+# Smaller pictures for players on a slow link (src/compact.rs): BMP and JPEG
+# decoders, and libwebp's lossy encoder, built from the source it bundles.
+image = { version = "0.25", default-features = false, features = ["bmp", "jpeg"] }
+webp = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process", "fs"] }

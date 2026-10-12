@@ -409,6 +409,7 @@ pub fn config_for(root: &Path, overrides: &[(&str, &str)]) -> Config {
         "APP_PROXY_PREFIX",
         "APP_PROXY_TARGET",
         "WEB_SERVER_TARGET",
+        "COMPACT_IMAGE_QUALITY",
     ];
     for key in managed {
         std::env::remove_var(key);

@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::client::Client;
+use crate::compact;
 use crate::config::Config;
 use crate::encoding::latin1_decode;
 use crate::http::{self, Cors};
@@ -339,6 +340,15 @@ async fn serve_path(State(state): State<AppState>, request: Request) -> Response
     // 3. Assets: local files, the override directory, then the archives.
     match state.client.get_file(&relative).await {
         Some(file) => {
+            // A remote player's proxy asks for compact pictures (compact.rs).
+            let quality = state.cfg.compact_image_quality;
+            let compact = compact::wanted(&headers, &relative, file.data.len(), quality);
+            if compact {
+                let etag = compact::etag(&file.etag, quality);
+                if http::etag_matches(&headers, &etag) {
+                    return finish(http::not_modified(&etag), is_head);
+                }
+            }
             let coding = http::asset_coding(
                 &headers,
                 &relative,
@@ -356,6 +366,16 @@ async fn serve_path(State(state): State<AppState>, request: Request) -> Response
                     .map(|body| (coding, body)),
                 _ => None,
             };
+            if compact && !revalidating {
+                if let Some(body) = state.client.compacted(&relative, &file, quality).await {
+                    // Brotli can still win on a small, flat picture.
+                    let sent = encoded.as_ref().map_or(file.data.len(), |(_, b)| b.len());
+                    if body.len() < sent {
+                        let etag = compact::etag(&file.etag, quality);
+                        return finish(http::compact_response(&etag, &body), is_head);
+                    }
+                }
+            }
             let response = http::asset_response(
                 &headers,
                 &relative,

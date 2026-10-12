@@ -22,6 +22,10 @@ pub struct Config {
     pub enable_static_serve: bool,
     pub enable_wsproxy: bool,
     pub enable_compression: bool,
+    /// `COMPACT_IMAGE_QUALITY`: the WebP quality (1-100) a request carrying
+    /// `X-Compact-Images: 1` gets BMPs and JPEGs in; 0 sends the originals to
+    /// everyone (compact.rs).
+    pub compact_image_quality: u8,
     pub robrowser_path: PathBuf,
     pub ws_allowed_targets: Vec<String>,
     pub data_override_path: Option<PathBuf>,
@@ -201,6 +205,7 @@ impl Config {
             enable_static_serve: env_bool("ENABLE_STATIC_SERVE", false),
             enable_wsproxy: env_bool("ENABLE_WSPROXY", false),
             enable_compression: env_bool("ENABLE_COMPRESSION", true),
+            compact_image_quality: env_usize("COMPACT_IMAGE_QUALITY", 85).min(100) as u8,
             robrowser_path,
             ws_allowed_targets,
             data_override_path,

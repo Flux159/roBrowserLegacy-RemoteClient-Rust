@@ -1219,3 +1219,96 @@ async fn emblems_are_not_forwarded_without_a_loopback_web_server() {
     let response = request(server.addr, "POST", "/emblem/download", &[], Some(b"{}")).await;
     assert_eq!(response.status, 502);
 }
+
+/// A 64x64 24-bit BMP with enough detail that a lossy WebP is much smaller.
+fn noisy_bmp() -> Vec<u8> {
+    let (w, h) = (64u32, 64u32);
+    let mut out = Vec::new();
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(54 + w * h * 3).to_le_bytes());
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&h.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&[0; 24]);
+    for y in 0..h {
+        for x in 0..w {
+            let n = ((x * 7 + y * 13) % 17) as u8;
+            out.extend_from_slice(&[128 + n, (y * 4) as u8, (x * 4) as u8 ^ n]);
+        }
+    }
+    out
+}
+
+async fn picture_server(overrides: &[(&str, &str)]) -> (TempDir, TestServer) {
+    let dir = TempDir::new("compact");
+    GrfBuilder::new()
+        .file("data\\texture\\wall.bmp", &noisy_bmp())
+        .write_v200(&dir.join("resources/data.grf"));
+    write_data_ini(&dir.path, &["data.grf"]);
+    let client = client_for(&dir.path, overrides);
+    let cfg = config_for(&dir.path, overrides);
+    let server = TestServer::start(cfg, client, json!({ "status": "ok" })).await;
+    (dir, server)
+}
+
+#[tokio::test]
+async fn a_request_for_compact_images_gets_a_smaller_webp_with_its_own_etag() {
+    let (_dir, server) = picture_server(&[]).await;
+    let headers = [
+        ("X-Compact-Images", "1"),
+        ("Accept-Encoding", "gzip, deflate, br"),
+    ];
+    let response = request(server.addr, "GET", "/data/texture/wall.bmp", &headers, None).await;
+
+    assert_eq!(response.status, 200);
+    assert_eq!(response.header("content-type"), Some("image/webp"));
+    assert_eq!(response.header("content-encoding"), None);
+    assert_eq!(
+        response.header("vary"),
+        Some("Accept-Encoding, X-Compact-Images")
+    );
+    assert_eq!(&response.body[..4], b"RIFF");
+    assert_eq!(&response.body[8..12], b"WEBP");
+    assert!(response.body.len() < noisy_bmp().len() / 2);
+    let etag = response.header("etag").unwrap().to_string();
+    assert!(etag.ends_with("-w85\""), "{etag}");
+
+    let again = request(
+        server.addr,
+        "GET",
+        "/data/texture/wall.bmp",
+        &[("X-Compact-Images", "1"), ("If-None-Match", &etag)],
+        None,
+    )
+    .await;
+    assert_eq!(again.status, 304);
+    assert_eq!(again.header("etag"), Some(etag.as_str()));
+}
+
+#[tokio::test]
+async fn without_the_header_a_picture_is_sent_exactly() {
+    let (_dir, server) = picture_server(&[]).await;
+    let response = request(server.addr, "GET", "/data/texture/wall.bmp", &[], None).await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.header("content-type"), Some("image/bmp"));
+    assert_eq!(response.body, noisy_bmp());
+}
+
+#[tokio::test]
+async fn compact_images_can_be_switched_off() {
+    let (_dir, server) = picture_server(&[("COMPACT_IMAGE_QUALITY", "0")]).await;
+    let response = request(
+        server.addr,
+        "GET",
+        "/data/texture/wall.bmp",
+        &[("X-Compact-Images", "1")],
+        None,
+    )
+    .await;
+    assert_eq!(response.header("content-type"), Some("image/bmp"));
+    assert_eq!(response.body, noisy_bmp());
+}

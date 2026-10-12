@@ -7,6 +7,7 @@
 pub mod appproxy;
 pub mod cache;
 pub mod client;
+pub mod compact;
 pub mod config;
 pub mod des;
 pub mod encoding;

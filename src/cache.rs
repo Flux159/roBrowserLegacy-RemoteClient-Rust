@@ -32,6 +32,8 @@ pub struct CachedFile {
 pub struct Encodings {
     br: OnceLock<Option<Arc<Vec<u8>>>>,
     gzip: OnceLock<Option<Arc<Vec<u8>>>>,
+    /// The compact (WebP) form of a picture; see compact.rs.
+    pub compact: OnceLock<Option<Arc<Vec<u8>>>>,
 }
 
 impl Encodings {
