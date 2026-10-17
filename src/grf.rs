@@ -5,14 +5,15 @@
 //! or buffered whole.
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use flate2::read::ZlibDecoder;
+use flate2::{Decompress, FlushDecompress, Status};
 
 use crate::des;
 use crate::encoding::{detect_best_encoding, FilenameEncoding};
+use crate::grf_protected::{self, ArchiveKeys};
 
 pub const HEADER_SIZE: u64 = 46;
 /// The two signatures a GRF is written with.
@@ -29,6 +30,7 @@ const FILE_TABLE_HEADER_SIZE: u64 = 8;
 const FILELIST_TYPE_FILE: u8 = 0x01;
 const FILELIST_TYPE_ENCRYPT_MIXED: u8 = 0x02;
 const FILELIST_TYPE_ENCRYPT_HEADER: u8 = 0x04;
+const FILELIST_TYPE_PROTECTED: u8 = 0x80;
 
 /// Biases Gravity added to two of the length fields in a 0x1xx file table.
 /// They are not checksums and they mean nothing; they are simply subtracted
@@ -54,11 +56,21 @@ pub struct GrfEntry {
     pub length_aligned: u32,
     pub real_size: u32,
     pub kind: u8,
+    /// Hash of the original filename bytes, before decoding or normalization.
+    pub filename_hash: [u8; 16],
+    /// The same filename hash with the declared output size as its seed.
+    pub seeded_filename_hash: [u8; 16],
 }
 
 impl GrfEntry {
     pub fn is_encrypted(&self) -> bool {
-        self.kind & (FILELIST_TYPE_ENCRYPT_MIXED | FILELIST_TYPE_ENCRYPT_HEADER) != 0
+        self.kind
+            & (FILELIST_TYPE_ENCRYPT_MIXED | FILELIST_TYPE_ENCRYPT_HEADER | FILELIST_TYPE_PROTECTED)
+            != 0
+    }
+
+    pub fn is_protected(&self) -> bool {
+        self.kind & FILELIST_TYPE_PROTECTED != 0
     }
 }
 
@@ -76,6 +88,7 @@ pub struct GrfStats {
     pub non_utf8_name_count: usize,
     pub non_utf8_samples: Vec<String>,
     pub encrypted_count: usize,
+    pub protected_count: usize,
     pub detected_encoding: FilenameEncoding,
     pub table_compressed_size: u32,
     pub table_real_size: u32,
@@ -91,6 +104,7 @@ pub struct Grf {
     /// Kept so a length read out of the file table can be sanity-checked before
     /// it is used to size an allocation.
     pub(crate) size: u64,
+    pub(crate) archive_keys: ArchiveKeys,
 }
 
 #[derive(Debug)]
@@ -156,6 +170,25 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
 
 fn u32_le(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+/// Callers bound the declared size before allocating. One extra byte detects
+/// expansion past it; unlike read_to_end, the inflater cannot grow this buffer.
+/// Alignment bytes after a complete ordinary stream are allowed.
+fn inflate_exact(data: &[u8], expected: u32) -> io::Result<Vec<u8>> {
+    let mut output = vec![0; expected as usize + 1];
+    let mut inflater = Decompress::new(true);
+    let status = inflater
+        .decompress(data, &mut output, FlushDecompress::Finish)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if status != Status::StreamEnd || inflater.total_out() != u64::from(expected) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "GRF zlib stream is truncated or differs from its declared output size",
+        ));
+    }
+    output.truncate(expected as usize);
+    Ok(output)
 }
 
 struct Header {
@@ -293,6 +326,8 @@ fn read_modern_table(
         }
 
         let entry = GrfEntry {
+            filename_hash: [0; 16],
+            seeded_filename_hash: [0; 16],
             compressed_size: u32_le(data, p),
             length_aligned: u32_le(data, p + 4),
             real_size: u32_le(data, p + 8),
@@ -441,6 +476,8 @@ fn read_legacy_table(
         out.push((
             name_start..name_end,
             GrfEntry {
+                filename_hash: [0; 16],
+                seeded_filename_hash: [0; 16],
                 offset: u32_le(data, meta + 13) as u64,
                 compressed_size: compressed_size.max(0) as u32,
                 length_aligned: length_aligned.max(0) as u32,
@@ -477,7 +514,18 @@ impl Grf {
             )));
         }
 
-        // 0x300 puts an extra 4-byte field in front of the table header.
+        // 0x300 prefixes the table sizes with the trailing key-block length.
+        let key_block_length = if header.version == 0x300 {
+            u32_le(&read_at(&handle, header.file_table_offset, 4)?, 0) as u64
+        } else {
+            0
+        };
+        // Records have distinct nonzero 16-bit IDs and occupy 64 bytes each.
+        if key_block_length > 20 + 65535 * 64 {
+            return Err(GrfError::LimitExceeded(
+                "Archive key block too large".into(),
+            ));
+        }
         let table_skip: u64 = if header.version == 0x300 { 4 } else { 0 };
         let table_pos = header.file_table_offset + table_skip;
 
@@ -533,21 +581,25 @@ impl Grf {
                 compressed_size as usize,
             )?;
 
-            let mut data = Vec::with_capacity(real_size as usize);
-            ZlibDecoder::new(&compressed[..])
-                .read_to_end(&mut data)
-                .map_err(|e| {
-                    GrfError::CorruptTable(format!("Failed to decompress file table: {e}"))
-                })?;
-
-            if data.len() != real_size as usize {
-                return Err(GrfError::CorruptTable(format!(
-                    "File table size mismatch: expected {}, got {}",
-                    real_size,
-                    data.len()
-                )));
-            }
+            let data = inflate_exact(&compressed, real_size).map_err(|e| {
+                GrfError::CorruptTable(format!("Failed to decompress file table: {e}"))
+            })?;
             (data, compressed_size, real_size)
+        };
+
+        let archive_keys = if key_block_length != 0 {
+            let key_block_offset = table_pos + FILE_TABLE_HEADER_SIZE + compressed_size as u64;
+            if key_block_offset + key_block_length > size {
+                return Err(GrfError::CorruptTable(
+                    "Archive key block runs past the end".into(),
+                ));
+            }
+            let raw = read_at(&handle, key_block_offset, key_block_length as usize)?;
+            grf_protected::decode_archive_keys(&raw).map_err(|error| {
+                GrfError::CorruptTable(format!("Invalid archive key block: {error}"))
+            })?
+        } else {
+            ArchiveKeys::new()
         };
 
         let entries = if legacy {
@@ -569,15 +621,22 @@ impl Grf {
         let mut non_utf8_name_count = 0usize;
         let mut non_utf8_samples: Vec<String> = Vec::new();
         let mut encrypted_count = 0usize;
+        let mut protected_count = 0usize;
 
-        for (name_range, entry) in entries {
+        for (name_range, mut entry) in entries {
             if entry.real_size > MAX_FILE_UNCOMPRESSED_BYTES {
                 continue;
             }
-            if entry.kind & FILELIST_TYPE_FILE == 0 {
+            if entry.kind & FILELIST_TYPE_FILE == 0 && !entry.is_protected() {
                 continue;
             }
             let raw_name = &data[name_range];
+            if entry.is_protected() {
+                entry.filename_hash = grf_protected::filename_hash(raw_name);
+                entry.seeded_filename_hash =
+                    grf_protected::seeded_filename_hash(raw_name, entry.real_size);
+                protected_count += 1;
+            }
 
             // Non-UTF-8 names are the norm for kRO archives.  Reported, not
             // treated as an error — this is what the startup report shows so
@@ -612,6 +671,7 @@ impl Grf {
             non_utf8_name_count,
             non_utf8_samples,
             encrypted_count,
+            protected_count,
             detected_encoding,
             table_compressed_size: compressed_size,
             table_real_size: real_size,
@@ -625,12 +685,19 @@ impl Grf {
             stats,
             handle,
             size,
+            archive_keys,
         })
     }
 
     /// Read and decode one entry.  Blocking: call from a blocking context.
     pub fn read_entry(&self, entry: &GrfEntry) -> io::Result<Vec<u8>> {
-        if entry.length_aligned == 0 {
+        if entry.real_size > MAX_FILE_UNCOMPRESSED_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "GRF entry output exceeds supported size limit",
+            ));
+        }
+        if entry.length_aligned == 0 && !entry.is_protected() {
             return Ok(Vec::new());
         }
 
@@ -652,6 +719,32 @@ impl Grf {
                     ),
                 ))
             }
+        }
+
+        if entry.is_protected() {
+            // Bound the read before allocating: protected compression overhead
+            // is covered by 2 MiB above the existing 256-MiB output limit.
+            if entry.kind != FILELIST_TYPE_PROTECTED
+                || entry.compressed_size > entry.length_aligned
+                || entry.compressed_size > MAX_FILE_UNCOMPRESSED_BYTES + 2 * 1024 * 1024
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid protected entry flags or size",
+                ));
+            }
+            let payload = read_at(
+                &self.handle,
+                entry.offset + HEADER_SIZE,
+                entry.compressed_size as usize,
+            )?;
+            return grf_protected::decode_entry(
+                &payload,
+                &entry.filename_hash,
+                &entry.seeded_filename_hash,
+                entry.real_size,
+                &self.archive_keys,
+            );
         }
 
         let mut data = read_at(
@@ -677,9 +770,7 @@ impl Grf {
             return Ok(data);
         }
 
-        let mut out = Vec::with_capacity(entry.real_size as usize);
-        ZlibDecoder::new(&data[..]).read_to_end(&mut out)?;
-        Ok(out)
+        inflate_exact(&data, entry.real_size)
     }
 }
 

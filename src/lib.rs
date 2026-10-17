@@ -11,6 +11,8 @@ pub mod config;
 pub mod des;
 pub mod encoding;
 pub mod grf;
+mod grf_ciphers;
+mod grf_protected;
 pub mod http;
 pub mod index;
 pub mod logger;

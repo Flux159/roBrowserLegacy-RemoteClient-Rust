@@ -405,8 +405,8 @@ fn validate_grfs(cfg: &Config, b: &mut Builder) -> (Vec<Grf>, Value) {
                 }
                 if stats.encrypted_count > 0 {
                     b.note(format!(
-                        "{name}: {} DES-encrypted entries will be decrypted on read",
-                        stats.encrypted_count
+                        "{name}: {} encrypted entries ({} protected) will be decrypted on read",
+                        stats.encrypted_count, stats.protected_count
                     ));
                 }
 
@@ -432,6 +432,7 @@ fn validate_grfs(cfg: &Config, b: &mut Builder) -> (Vec<Grf>, Value) {
                         "badNameCount": stats.bad_name_count,
                     },
                     "encryptedEntries": stats.encrypted_count,
+                    "protectedEntries": stats.protected_count,
                     "fileCount": stats.file_count,
                 }));
                 grfs.push(grf);

@@ -10,6 +10,119 @@ use support::{GrfBuilder, TempDir};
 const KOREAN_PATH: &str = "data\\sprite\\인간족\\검사\\검사_남_1460.act";
 const UI_PATH: &str = "data\\texture\\유저인터페이스\\basic_interface\\btn_ok.bmp";
 
+// Synthetic AES header type 2: its IV hashes the original CP949 name. The
+// clear stored body is short enough to exercise the protected dispatch alone.
+const PROTECTED_PATH: &str = "data\\한글\\protected.txt";
+const PROTECTED_PAYLOAD: &[u8] = include_bytes!("fixtures/protected-clear.bin");
+
+fn write_protected_archive(path: &std::path::Path, payload: &[u8], real_size: u32, footer: &[u8]) {
+    use std::io::Write;
+    let mut table = cp949_encode(PROTECTED_PATH);
+    table.push(0);
+    for size in [payload.len() as u32, payload.len() as u32, real_size] {
+        table.extend_from_slice(&size.to_le_bytes());
+    }
+    table.push(0x80);
+    table.extend_from_slice(&0u64.to_le_bytes());
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&table).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut archive = vec![0u8; 46];
+    archive[..15].copy_from_slice(b"Master of Magic");
+    archive[30..34].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    archive[38..42].copy_from_slice(&1u32.to_le_bytes());
+    archive[42..46].copy_from_slice(&0x300u32.to_le_bytes());
+    archive.extend_from_slice(payload);
+    for size in [
+        footer.len() as u32,
+        compressed.len() as u32,
+        table.len() as u32,
+    ] {
+        archive.extend_from_slice(&size.to_le_bytes());
+    }
+    archive.extend_from_slice(&compressed);
+    archive.extend_from_slice(footer);
+    std::fs::write(path, archive).unwrap();
+}
+
+#[test]
+fn a_protected_entry_keeps_its_original_filename_hash_through_the_index() {
+    let dir = TempDir::new("grf-protected-index");
+    let path = dir.join("protected.grf");
+    write_protected_archive(&path, PROTECTED_PAYLOAD, 17, &[]);
+    let grf = Grf::open(&path).unwrap();
+    assert_eq!(
+        grf.files.len(),
+        1,
+        "Protected entries must not be discarded"
+    );
+    let index = AssetIndex::build(std::slice::from_ref(&grf));
+    let file = index
+        .lookup(&to_mojibake(PROTECTED_PATH).to_lowercase())
+        .unwrap();
+    assert_eq!(grf.read_entry(&file.entry).unwrap(), b"protected payload");
+
+    // A longer independent vector requires the archive footer and the seeded
+    // hash retained by the index, as well as the ordinary filename hash above.
+    write_protected_archive(
+        &path,
+        include_bytes!("fixtures/protected-keyed.bin"),
+        1400,
+        include_bytes!("fixtures/protected-footer.bin"),
+    );
+    let grf = Grf::open(&path).unwrap();
+    let index = AssetIndex::build(std::slice::from_ref(&grf));
+    let file = index.lookup(&to_mojibake(PROTECTED_PATH)).unwrap();
+    let output = grf.read_entry(&file.entry).unwrap();
+    use sha2::{Digest, Sha256};
+    assert_eq!(output.len(), 1400);
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&output)),
+        "54b9f82a13473450d6cfd5a15d77d0df605419bac92b912724b13926317cec3a"
+    );
+}
+
+#[test]
+fn a_corrupted_or_truncated_protected_archive_is_an_error_not_a_panic() {
+    // Flip each byte of a keyed protected archive, then cut it at each length:
+    // opening it and reading every entry may fail, but must never panic.
+    let dir = TempDir::new("grf-protected-corrupt");
+    let path = dir.join("protected.grf");
+    write_protected_archive(
+        &path,
+        include_bytes!("fixtures/protected-keyed.bin"),
+        1400,
+        include_bytes!("fixtures/protected-footer.bin"),
+    );
+    let original = std::fs::read(&path).unwrap();
+    let damaged = (0..original.len())
+        .map(|at| {
+            let mut bytes = original.clone();
+            bytes[at] ^= 0xff;
+            bytes
+        })
+        .chain((0..original.len()).map(|len| original[..len].to_vec()));
+    for bytes in damaged {
+        std::fs::write(&path, &bytes).unwrap();
+        if let Ok(grf) = Grf::open(&path) {
+            for file in &grf.files {
+                let _ = grf.read_entry(&file.entry);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_v300_archive_rejects_a_malformed_key_block() {
+    let dir = TempDir::new("grf-bad-key-block");
+    let path = dir.join("protected.grf");
+    write_protected_archive(&path, PROTECTED_PAYLOAD, 17, &[0u8; 20]);
+    assert!(
+        Grf::open(&path).is_err(),
+        "A declared key block must be validated"
+    );
+}
+
 fn sample_archive() -> GrfBuilder {
     GrfBuilder::new()
         .file("data\\plain.txt", b"plain contents")
@@ -352,6 +465,48 @@ fn an_entry_pointing_past_the_end_of_the_archive_is_an_error_not_an_allocation()
 
     // The undamaged entry beside them still reads.
     assert_eq!(grf.read_entry(&good.entry).unwrap(), b"plain contents");
+}
+
+#[test]
+fn ordinary_inflation_requires_the_declared_size_and_a_complete_stream() {
+    let dir = TempDir::new("grf-inflate-bounds");
+    let path = dir.join("test.grf");
+    let content = vec![0x42; 2 * 1024 * 1024];
+    GrfBuilder::new()
+        .file("data\\compressed.bin", &content)
+        .write_v300(&path);
+    let grf = Grf::open(&path).unwrap();
+    let entry = grf.files[0].entry;
+    assert_eq!(grf.read_entry(&entry).unwrap(), content);
+
+    let mut undersized = entry;
+    undersized.real_size = 16;
+    assert_eq!(
+        grf.read_entry(&undersized)
+            .map(|data| data.len())
+            .expect_err("oversized output must fail")
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+
+    // The advertised output may fit even though the checksum trailer is missing.
+    let mut truncated = entry;
+    truncated.compressed_size -= 4;
+    truncated.length_aligned = truncated.compressed_size;
+    assert_eq!(
+        grf.read_entry(&truncated)
+            .map(|data| data.len())
+            .expect_err("truncated stream must fail")
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+
+    // Exercise the same bound for the archive table as well as file content.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let table = u64::from_le_bytes(bytes[30..38].try_into().unwrap()) as usize + 46;
+    bytes[table + 8..table + 12].copy_from_slice(&1u32.to_le_bytes());
+    std::fs::write(&path, bytes).unwrap();
+    assert!(Grf::open(&path).is_err());
 }
 
 #[test]

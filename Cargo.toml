@@ -34,6 +34,9 @@ httpdate = "1"
 # potentially reused control port. Use audited primitives, not custom crypto.
 hmac = "0.12"
 sha2 = "0.10"
+aes = "0.8.4"
+xxhash-rust = { version = "0.8.15", features = ["xxh32", "xxh3"] }
+lz4_flex = { version = "0.10.0", default-features = false, features = ["std", "safe-decode", "checked-decode"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process", "fs"] }

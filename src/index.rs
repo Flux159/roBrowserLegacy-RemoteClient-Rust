@@ -175,6 +175,8 @@ mod tests {
                         length_aligned: 1,
                         real_size: 1,
                         kind: 1,
+                        filename_hash: [0; 16],
+                        seeded_filename_hash: [0; 16],
                     },
                 })
                 .collect(),
@@ -184,12 +186,14 @@ mod tests {
                 non_utf8_name_count: 0,
                 non_utf8_samples: vec![],
                 encrypted_count: 0,
+                protected_count: 0,
                 detected_encoding: FilenameEncoding::Cp949,
                 table_compressed_size: 0,
                 table_real_size: 0,
             },
             handle: null_handle(),
             size: 0,
+            archive_keys: Default::default(),
         }
     }
 

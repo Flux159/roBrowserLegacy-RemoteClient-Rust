@@ -44,6 +44,12 @@ entries accept absolute GRF paths, with lower indices taking priority; archives
 are opened in place without file links or copies. Keep the resources directory
 present for startup validation even when its archive entries are all absolute.
 
+Protected version 3 GRFs use their archive key block and original filename
+bytes for decoding. Body ciphers `1`, `5`, `7`, `128` and `133` are supported,
+with descriptor checksums, output-size checks and content hashes verified before
+serving. Unknown formats and damaged protected entries fail explicitly; no game
+executable or extraction step is needed.
+
 `BGM_PATH` and `AI_PATH` provide read-only fallbacks for their respective request
 namespaces. Resolution checks the memory cache, app-owned loose files, the
 selected namespace folder, the translation override, then the GRFs. Nested
