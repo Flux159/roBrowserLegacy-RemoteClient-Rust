@@ -44,6 +44,15 @@ pub struct Config {
     /// a server that keeps serving those copies after an archive is replaced —
     /// clear the extracted tree when you swap a GRF.
     pub client_autoextract: bool,
+    /// `REMOTE_GRF_DATA=false`: the archives and the selected client
+    /// directories (BGM/, AI/) go only to this machine. A request from another
+    /// address, or one carrying `X-Ragnarok-Remote` (a proxy in front of this
+    /// server says so), gets only what the server root and the override
+    /// directory provide, and search and the file list are empty for it. For a
+    /// host whose players bring their own client files. It also turns
+    /// auto-extract off, since an extracted copy is a loose file like a mod's;
+    /// clear an already extracted tree when switching it on. On by default.
+    pub remote_grf_data: bool,
     /// Override GRF filename decoding instead of detecting it.  `auto` (the
     /// default) is right almost always; this is the escape hatch for an archive
     /// it gets wrong.
@@ -213,7 +222,9 @@ impl Config {
             client_respath: env("CLIENT_RESPATH").unwrap_or_else(|| "resources/".to_string()),
             client_dataini: env("CLIENT_DATAINI").unwrap_or_else(|| "DATA.INI".to_string()),
             client_enablesearch: env_bool("CLIENT_ENABLESEARCH", true),
-            client_autoextract: env_bool("CLIENT_AUTOEXTRACT", true),
+            client_autoextract: env_bool("CLIENT_AUTOEXTRACT", true)
+                && env_bool("REMOTE_GRF_DATA", true),
+            remote_grf_data: env_bool("REMOTE_GRF_DATA", true),
             grf_filename_encoding: match env("GRF_FILENAME_ENCODING").as_deref() {
                 Some("cp949") | Some("euc-kr") => Some(FilenameEncoding::Cp949),
                 Some("utf-8") | Some("utf8") => Some(FilenameEncoding::Utf8),
