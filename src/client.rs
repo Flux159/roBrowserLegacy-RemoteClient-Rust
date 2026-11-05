@@ -118,13 +118,24 @@ impl Client {
     /// Resolve a request path to bytes.  Blocking — GRF reads seek into a
     /// multi-gigabyte file and then inflate.
     pub fn resolve(&self, req_path: &str) -> Option<(CachedFile, Source)> {
+        self.resolve_with(req_path, true)
+    }
+
+    /// `resolve`, or with `game_data` false only what this server adds to the
+    /// game: the files under its root (a host's mods, translation, merged
+    /// tables) and `DATA_OVERRIDE_PATH`. Never the archives or the selected
+    /// client directories, and never a cached copy, which may have come from
+    /// either. A miss here is not a missing file, so nothing is logged.
+    pub fn resolve_with(&self, req_path: &str, game_data: bool) -> Option<(CachedFile, Source)> {
         if !public_asset_path(req_path) || safe_join(&self.cfg.root, req_path).is_none() {
             return None;
         }
         let key = Self::cache_key(req_path);
 
-        if let Some(hit) = self.cache.get(&key) {
-            return Some((hit, Source::Cache));
+        if game_data {
+            if let Some(hit) = self.cache.get(&key) {
+                return Some((hit, Source::Cache));
+            }
         }
 
         // 2. Loose files shipped beside the server: System/, BGM/, AI/, and
@@ -152,7 +163,10 @@ impl Client {
             } else {
                 None
             };
-            if let Some(path) = base.and_then(|base| confined_file(base, relative)) {
+            if let Some(path) = base
+                .filter(|_| game_data)
+                .and_then(|base| confined_file(base, relative))
+            {
                 match std::fs::read(path) {
                     Ok(content) => {
                         let file = self.cache.insert(&key, Arc::new(content));
@@ -178,6 +192,10 @@ impl Client {
                     }
                 }
             }
+        }
+
+        if !game_data {
+            return None;
         }
 
         // 4./5. The archives, under the requested spelling and then under the
@@ -222,6 +240,22 @@ impl Client {
 
         self.log_missing(req_path);
         None
+    }
+
+    /// `get_file`, or with `game_data` false only what `resolve_with` allows.
+    pub async fn get_file_with(
+        self: &Arc<Self>,
+        req_path: &str,
+        game_data: bool,
+    ) -> Option<CachedFile> {
+        if game_data {
+            return self.get_file(req_path).await;
+        }
+        let this = Arc::clone(self);
+        let path = req_path.to_string();
+        tokio::task::spawn_blocking(move || this.resolve_with(&path, false).map(|(f, _)| f))
+            .await
+            .unwrap_or(None)
     }
 
     /// Async wrapper: fast path on a cache hit, blocking pool otherwise.

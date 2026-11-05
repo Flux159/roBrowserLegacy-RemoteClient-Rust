@@ -405,6 +405,7 @@ pub fn config_for(root: &Path, overrides: &[(&str, &str)]) -> Config {
         "CLIENT_DATAINI",
         "CLIENT_ENABLESEARCH",
         "CLIENT_AUTOEXTRACT",
+        "REMOTE_GRF_DATA",
         "GRF_FILENAME_ENCODING",
         "APP_PROXY_PREFIX",
         "APP_PROXY_TARGET",

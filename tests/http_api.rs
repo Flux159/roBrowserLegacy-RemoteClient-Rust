@@ -1336,3 +1336,125 @@ async fn emblems_are_not_forwarded_without_a_loopback_web_server() {
     let response = request(server.addr, "POST", "/emblem/download", &[], Some(b"{}")).await;
     assert_eq!(response.status, 502);
 }
+
+// ---------------------------------------------------------------------------
+// REMOTE_GRF_DATA=false: the game data stays on this machine
+// ---------------------------------------------------------------------------
+
+const REMOTE: (&str, &str) = ("X-Ragnarok-Remote", "1");
+
+#[tokio::test]
+async fn without_remote_grf_data_a_remote_request_gets_only_what_the_host_adds() {
+    let music = TempDir::new("http-remote-music");
+    music.write("BGM/theme.mp3", b"the host's own music");
+    let translation = TempDir::new("http-remote-translation");
+    translation.write("data/msgstringtable.txt", b"translated");
+    let (dir, server) = server(&[
+        ("REMOTE_GRF_DATA", "false"),
+        ("BGM_PATH", music.join("BGM").to_str().unwrap()),
+        (
+            "DATA_OVERRIDE_PATH",
+            translation.join("data").to_str().unwrap(),
+        ),
+    ])
+    .await;
+    dir.write("data/mod.txt", b"a mod's file");
+
+    // This machine still gets everything; that is the host's own client.
+    let local = request(server.addr, "GET", "/data/hello.txt", &[], None).await;
+    assert_eq!(local.status, 200);
+    assert_eq!(local.body, b"hello from the archive");
+
+    // A remote request gets the archive's file neither fresh nor from the
+    // cache the request above just filled, and not the host's music.
+    for path in ["/data/hello.txt", "/BGM/theme.mp3"] {
+        assert_eq!(
+            request(server.addr, "GET", path, &[REMOTE], None)
+                .await
+                .status,
+            404,
+            "{path}"
+        );
+    }
+    // What the host adds is still served: loose files and the override.
+    let added = request(server.addr, "GET", "/data/mod.txt", &[REMOTE], None).await;
+    assert_eq!((added.status, added.body), (200, b"a mod's file".to_vec()));
+    let text = request(
+        server.addr,
+        "GET",
+        "/data/msgstringtable.txt",
+        &[REMOTE],
+        None,
+    )
+    .await;
+    assert_eq!((text.status, text.body), (200, b"translated".to_vec()));
+
+    let body = json!({"files": ["data/hello.txt", "data/mod.txt"]}).to_string();
+    let batch = request(
+        server.addr,
+        "POST",
+        "/batch",
+        &[("Content-Type", "application/json"), REMOTE],
+        Some(body.as_bytes()),
+    )
+    .await;
+    assert_eq!(batch.status, 200);
+    let results = batch.json();
+    assert!(results.get("data/hello.txt").is_none(), "{results}");
+    assert!(results.get("data/mod.txt").is_some(), "{results}");
+
+    let search = request(
+        server.addr,
+        "POST",
+        "/search",
+        &[
+            ("Content-Type", "application/x-www-form-urlencoded"),
+            REMOTE,
+        ],
+        Some(b"filter=hello"),
+    )
+    .await;
+    assert_eq!((search.status, search.body), (200, Vec::new()));
+    let list = request(server.addr, "GET", "/list-files", &[REMOTE], None).await;
+    assert_eq!(list.json(), json!([]));
+    let local_search = request(
+        server.addr,
+        "POST",
+        "/search",
+        &[("Content-Type", "application/x-www-form-urlencoded")],
+        Some(b"filter=hello"),
+    )
+    .await;
+    assert_eq!(local_search.body, b"data\\hello.txt");
+}
+
+#[tokio::test]
+async fn without_remote_grf_data_nothing_is_extracted_to_disk() {
+    let (dir, server) =
+        server(&[("REMOTE_GRF_DATA", "false"), ("CLIENT_AUTOEXTRACT", "true")]).await;
+    assert_eq!(
+        request(server.addr, "GET", "/data/hello.txt", &[], None)
+            .await
+            .status,
+        200
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // An extracted copy would be a loose file, served to anyone like a mod's.
+    assert!(!dir.join("data/hello.txt").exists());
+    assert_eq!(
+        request(server.addr, "GET", "/data/hello.txt", &[REMOTE], None)
+            .await
+            .status,
+        404
+    );
+}
+
+#[tokio::test]
+async fn by_default_the_remote_header_changes_nothing() {
+    let (_dir, server) = server(&[]).await;
+    let response = request(server.addr, "GET", "/data/hello.txt", &[REMOTE], None).await;
+    assert_eq!(
+        (response.status, response.body),
+        (200, b"hello from the archive".to_vec())
+    );
+}

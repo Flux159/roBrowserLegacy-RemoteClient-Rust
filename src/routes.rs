@@ -2,12 +2,13 @@
 //! asset resolution, and asset resolution is the fallback for everything else.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use axum::body::Body;
-use axum::extract::{ws::WebSocketUpgrade, Path, Request, State};
+use axum::extract::{ws::WebSocketUpgrade, ConnectInfo, Extension, Path, Request, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, LAST_MODIFIED, VARY,
 };
@@ -27,6 +28,16 @@ use crate::util::{base64_encode, extension_of, public_asset_path, safe_join};
 use crate::{debug, warn};
 
 const STATUS_PAGE: &str = include_str!("status.html");
+
+/// Set on a request by a proxy in front of this server that serves other
+/// machines (the app's friend gateway), so `REMOTE_GRF_DATA=false` holds for
+/// what it forwards from loopback.
+pub const REMOTE_HEADER: &str = "x-ragnarok-remote";
+
+/// Whether this request may be given the archives and the selected client
+/// directories (`Config::remote_grf_data`).
+#[derive(Clone, Copy)]
+pub struct GameData(pub bool);
 const MAX_BATCH_FILES: usize = 50;
 
 #[derive(Clone)]
@@ -78,9 +89,32 @@ pub fn router(state: AppState) -> Router {
         .fallback(serve_path)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            game_data_middleware,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             cors_middleware,
         ))
         .with_state(state)
+}
+
+/// Everyone gets the game data unless `REMOTE_GRF_DATA=false`; then only a
+/// loopback peer that no proxy has marked remote does. A request without a
+/// peer address (nothing serves without one) counts as remote.
+async fn game_data_middleware(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let allowed = state.cfg.remote_grf_data || {
+        let local = request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .is_some_and(|info| info.0.ip().is_loopback());
+        local && !request.headers().contains_key(REMOTE_HEADER)
+    };
+    request.extensions_mut().insert(GameData(allowed));
+    next.run(request).await
 }
 
 async fn cors_middleware(State(state): State<AppState>, request: Request, next: Next) -> Response {
@@ -144,11 +178,20 @@ async fn missing_files(State(state): State<AppState>, headers: HeaderMap) -> Res
     json_response(&headers, &state, &value, "no-store")
 }
 
-async fn list_files(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn list_files(
+    State(state): State<AppState>,
+    Extension(GameData(game_data)): Extension<GameData>,
+    headers: HeaderMap,
+) -> Response {
+    // The list is the archives' names, so there is nothing in it for a
+    // request that may not have them.
+    let names = if game_data {
+        state.client.list_files()
+    } else {
+        Vec::new()
+    };
     let value = Value::Array(
-        state
-            .client
-            .list_files()
+        names
             .into_iter()
             .map(|name| Value::String(name.to_string()))
             .collect(),
@@ -193,7 +236,12 @@ fn search_filter(headers: &HeaderMap, body: &[u8]) -> Option<String> {
     serde_json::from_slice::<SearchBody>(body).ok()?.filter
 }
 
-async fn search(State(state): State<AppState>, headers: HeaderMap, body: bytes::Bytes) -> Response {
+async fn search(
+    State(state): State<AppState>,
+    Extension(GameData(game_data)): Extension<GameData>,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+) -> Response {
     let filter = search_filter(&headers, &body).unwrap_or_default();
 
     if !state.cfg.client_enablesearch || filter.is_empty() {
@@ -211,7 +259,12 @@ async fn search(State(state): State<AppState>, headers: HeaderMap, body: bytes::
         return http::text(StatusCode::BAD_REQUEST, "Invalid filter expression");
     };
 
-    let matches = state.client.search(&regex);
+    // Search reads the archives' index, like the file list.
+    let matches = if game_data {
+        state.client.search(&regex)
+    } else {
+        Vec::new()
+    };
     let body = matches.join("\n").into_bytes();
     let response = Response::builder()
         .status(StatusCode::OK)
@@ -231,6 +284,7 @@ struct BatchBody {
 /// miss and moves on.
 async fn batch(
     State(state): State<AppState>,
+    Extension(GameData(game_data)): Extension<GameData>,
     headers: HeaderMap,
     body: Option<axum::Json<BatchBody>>,
 ) -> Response {
@@ -247,7 +301,7 @@ async fn batch(
 
     let mut results: BTreeMap<String, String> = BTreeMap::new();
     for path in files {
-        if let Some(file) = state.client.get_file(&path).await {
+        if let Some(file) = state.client.get_file_with(&path, game_data).await {
             results.insert(path, base64_encode(&file.data));
         }
     }
@@ -298,6 +352,10 @@ async fn serve_path(State(state): State<AppState>, request: Request) -> Response
 
     let raw_path = request.uri().path().to_string();
     let headers = request.headers().clone();
+    let game_data = request
+        .extensions()
+        .get::<GameData>()
+        .map_or(true, |GameData(allowed)| *allowed);
     let is_head = request.method() == Method::HEAD;
     let relative = decode_request_path(raw_path.trim_start_matches('/'));
 
@@ -337,7 +395,7 @@ async fn serve_path(State(state): State<AppState>, request: Request) -> Response
     }
 
     // 3. Assets: local files, the override directory, then the archives.
-    match state.client.get_file(&relative).await {
+    match state.client.get_file_with(&relative, game_data).await {
         Some(file) => {
             let coding = http::asset_coding(
                 &headers,
