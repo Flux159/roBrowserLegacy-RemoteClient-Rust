@@ -41,7 +41,7 @@ pub(crate) fn decode_archive_keys(raw: &[u8]) -> io::Result<ArchiveKeys> {
     if raw.is_empty() {
         return Ok(ArchiveKeys::new());
     }
-    if raw.len() < 20 || raw[..4] != [1, 1, 0, 0] {
+    if raw.len() >= 20 && raw[..4] == [1, 0, 0, 0] {
         // Archives written by kRO clients after 2026-11 carry a rotated key
         // block (magic 01 00 00 00) whose body cipher has not been published.
         // Reconstruct what we can instead of refusing the whole archive: the
@@ -49,6 +49,11 @@ pub(crate) fn decode_archive_keys(raw: &[u8]) -> io::Result<ArchiveKeys> {
         // its material or names a default key id; only entries naming a
         // rotated key fail later, per file, instead of everything failing now.
         return decode_archive_keys_tolerant(raw);
+    }
+    // Any other magic, or a truncated block, is damage rather than a format
+    // we know: refuse it, as before.
+    if raw.len() < 20 || raw[..4] != [1, 1, 0, 0] {
+        return Err(invalid("Unsupported or truncated GRF archive key block"));
     }
     let body_size = word(raw, 12) as usize;
     if body_size == 0
@@ -136,35 +141,35 @@ fn decode_archive_keys_tolerant(raw: &[u8]) -> io::Result<ArchiveKeys> {
     // the records in the clear, with the xxh32 checksum covering both. Patch
     // the defaults back in and let the checksum prove the layout before we
     // trust any record (layout documented by GRFEditor's fallback).
-    if raw.len() >= 20 {
-        let body_size = word(raw, 12) as usize;
-        if body_size != 0 && body_size % 64 == 0 && raw.len() - 20 == body_size {
-            let mut decoded = raw[20..].to_vec();
-            for (index, (id, key)) in KRO_DEFAULT_KEYS.iter().enumerate() {
-                if 64 * (index + 1) > decoded.len() {
-                    break;
-                }
-                decoded[64 * index..64 * index + 4].copy_from_slice(&id.to_le_bytes());
-                decoded[64 * index + 4..64 * index + 64].copy_from_slice(key);
-            }
-            if xxh32(&decoded, 0) == word(raw, 16) {
-                let mut keys = ArchiveKeys::new();
-                for record in decoded.chunks_exact(64) {
-                    let id = word(record, 0);
-                    if id == 0 || id > 65535 || keys.contains_key(&id) {
-                        return Ok(default_keys());
-                    }
-                    keys.insert(id, record[4..].try_into().expect("60-byte key record"));
-                }
-                return Ok(keys);
-            }
-        }
+    let body_size = word(raw, 12) as usize;
+    if body_size == 0 || body_size % 64 != 0 || raw.len() - 20 != body_size {
+        return Err(invalid("GRF archive key-block size mismatch"));
     }
+    let mut decoded = raw[20..].to_vec();
+    for (index, (id, key)) in KRO_DEFAULT_KEYS.iter().enumerate() {
+        if 64 * (index + 1) > decoded.len() {
+            break;
+        }
+        decoded[64 * index..64 * index + 4].copy_from_slice(&id.to_le_bytes());
+        decoded[64 * index + 4..64 * index + 64].copy_from_slice(key);
+    }
+    if xxh32(&decoded, 0) == word(raw, 16) {
+        let mut keys = ArchiveKeys::new();
+        for record in decoded.chunks_exact(64) {
+            let id = word(record, 0);
+            if id == 0 || id > 65535 || keys.contains_key(&id) {
+                return Ok(default_keys());
+            }
+            keys.insert(id, record[4..].try_into().expect("60-byte key record"));
+        }
+        return Ok(keys);
+    }
+    // A well-formed 01 00 00 00 block we cannot verify (the envelope changed
+    // again): the defaults still unlock most protected entries.
     eprintln!(
-        "warning: unrecognized GRF archive key block (magic {:02x?}); \
+        "warning: GRF archive key block (magic 01 00 00 00) did not verify; \
          falling back to the built-in kRO default keys, so protected entries \
-         that name a rotated key will be unavailable",
-        &raw[..raw.len().min(4)]
+         that name a rotated key will be unavailable"
     );
     Ok(default_keys())
 }
@@ -581,19 +586,19 @@ mod tests {
         assert_eq!(keys.len(), 6);
         assert_eq!(keys[&1], KRO_DEFAULT_KEYS[0].1);
         assert_eq!(keys[&4], KRO_DEFAULT_KEYS[3].1);
-        for i in 0..60 {
-            assert_eq!(keys[&5][i], (i as u8).wrapping_mul(17).wrapping_add(5));
-            assert_eq!(keys[&6][i], (i as u8).wrapping_mul(17).wrapping_add(6));
+        for (i, (five, six)) in keys[&5].iter().zip(keys[&6].iter()).enumerate() {
+            assert_eq!(*five, (i as u8).wrapping_mul(17).wrapping_add(5));
+            assert_eq!(*six, (i as u8).wrapping_mul(17).wrapping_add(6));
         }
     }
 
     #[test]
-    fn unrecognized_key_block_falls_back_to_default_keys() {
-        // A format we do not know must not take the whole archive down; the
-        // built-in defaults still unlock every protected entry that embeds
-        // its material or names a default key id.
+    fn unverified_rotated_key_block_falls_back_to_default_keys() {
+        // A rotated block whose checksum we cannot reproduce must not take
+        // the whole archive down; the built-in defaults still unlock every
+        // protected entry that embeds its material or names a default key id.
         let body = [0xabu8; 64];
-        let mut raw = vec![9, 9, 9, 9, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut raw = vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         raw.extend_from_slice(&(body.len() as u32).to_le_bytes());
         raw.extend_from_slice(&xxh32(&body, 0).to_le_bytes());
         raw.extend_from_slice(&body);
@@ -603,5 +608,9 @@ mod tests {
         for (id, key) in KRO_DEFAULT_KEYS {
             assert_eq!(keys[&id], key);
         }
+
+        // Any other magic is damage, not a format we know, and is refused.
+        raw[..4].copy_from_slice(&[9, 9, 9, 9]);
+        assert!(decode_archive_keys(&raw).is_err());
     }
 }
